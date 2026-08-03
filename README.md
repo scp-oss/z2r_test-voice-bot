@@ -1,4 +1,4 @@
-# z2r-test-voice-bot
+# z2r_test-voice-bot
 
 Discord-бот для проверки рабочих стратегий zapret2 (`DS_TLS` / `VOICE_UDP`)
 на голосовом канале Discord.
