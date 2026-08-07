@@ -436,8 +436,15 @@ class ZapretBot(commands.Bot):
         log.info("Загружено стратегий: %d (динамически, из z2r config)", len(state.strategies))
         guild = discord.Object(id=GUILD_ID)
         self.tree.copy_global_to(guild=guild)
-        await self.tree.sync(guild=guild)
-        log.info("Slash-команды синхронизированы для guild %s", GUILD_ID)
+        try:
+            await self.tree.sync(guild=guild)
+            log.info("Slash-команды синхронизированы для guild %s", GUILD_ID)
+        except discord.HTTPException as e:
+            # Не роняем весь процесс из-за slash-команд -- HTTP /probe для
+            # Zenith и voice-тесты им не пользуются вообще. Частая причина
+            # 403 (Missing Access) -- бот приглашён без scope
+            # applications.commands, нужен новый инвайт с обоими scope.
+            log.error("Не удалось синхронизировать slash-команды (не критично для Zenith): %s", e)
         await start_probe_server()
 
 
