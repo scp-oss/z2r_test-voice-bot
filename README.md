@@ -1,22 +1,72 @@
 # z2r_test-voice-bot
 
-Discord-бот для проверки рабочих стратегий zapret2 (`DS_TLS` / `VOICE_UDP`)
-на голосовом канале Discord.
+Discord-бот для проверки стратегий zapret2 (`VOICE_UDP`, профиль 6) на
+голосовом канале Discord — и тестовый клиент Zenith для того же профиля
+(см. "Интеграция с Zenith" ниже), один бот на обе задачи.
 
 ## Как это работает
 
-`/voice_test <strategy>`:
-1. Запускает твой скрипт переключения стратегии (`apply_cmd` из конфига)
-2. Бот заходит в фиксированный тестовый голосовой канал — это реальное
-   UDP-подключение к voice-серверу Discord (websocket handshake + IP
-   discovery по UDP), не имитация
-3. Держит соединение `HOLD_SECONDS` секунд, проверяя что оно не отвалилось
-4. Отключается и присылает результат в ЛС — и владельцу (`OWNER_USER_ID`),
-   и тому, кто запустил команду
+Список стратегий строится на лету — при каждом старте (и по
+`/refresh_strategies`) бот спрашивает у z2r актуальное число стратегий
+профиля 6 через `set_strategy_cli.sh max` (только чтение, `locked.tsv` не
+трогает). Статического yaml-файла со списком нет — не рассинхронизируется
+после правок конфига z2r.
 
-`/voice_test_all` — то же самое по очереди для всех стратегий из
-`config/strategies.yaml`, с паузой `STRATEGY_SWITCH_DELAY` между ними,
-в конце — сводный отчёт в ЛС (какие стратегии рабочие, время подключения).
+`/voice_test <strategy>`:
+1. Вытаскивает реальные `--lua-desync=...:strategy=N` строки нужного
+   номера прямо из `/opt/zapret2/config` и применяет их в **песочнице
+   Zenith** (изолированный `nfqws2`, не боевой) — см. "Песочница, не
+   прод" ниже.
+2. Бот заходит в фиксированный тестовый голосовой канал через эту
+   песочницу — это реальное UDP-подключение к voice-серверу Discord
+   (websocket handshake + IP discovery по UDP), не имитация.
+3. Держит соединение `HOLD_SECONDS` секунд, проверяя что оно не отвалилось.
+4. Отключается и присылает результат в ЛС — и владельцу (`OWNER_USER_ID`),
+   и тому, кто запустил команду.
+
+`/voice_test_all` — то же самое по очереди для всех стратегий, с паузой
+`STRATEGY_SWITCH_DELAY` между ними, в конце — сводный отчёт в ЛС (какие
+стратегии рабочие, время подключения). `/voice_rank <passes>` — то же
+самое в несколько проходов, с рейтингом по надёжности+скорости.
+
+## Песочница, не прод
+
+Раньше `/voice_test` переключал боевой `locked.tsv`
+(`set_strategy_cli.sh set`) — стратегия реально становилась активной для
+всех пользователей на время теста. Теперь — только изолированная
+песочница [Zenith](https://github.com/scp-oss/Zenith), боевой
+`/opt/zapret2` бот вообще не трогает. Это же даёт Zenith возможность
+гонять через этот бот СВОИ сгенерированные (ещё не существующие в
+конфиге z2r) геномы, не заводя отдельного токена — см. ниже.
+
+Отсюда требование: бот должен работать от системного юзера
+`zenith-sandbox` (тот же, что создаёт `Zenith/sandbox/setup_sandbox.sh`)
+— его исходящий UDP-трафик отдельно перехватывается узким iptables-
+правилом песочницы. И ему нужны права перезапускать
+`Zenith/sandbox/start_sandbox.sh` (сам скрипт требует root):
+
+```bash
+# сгенерировать конфиг песочницы (если ещё не было) и убедиться, что она вообще работает
+sudo /opt/z2r_autobench/Zenith/sandbox/setup_sandbox.sh
+
+# systemd-юнит бота — на юзера zenith-sandbox
+sudo systemctl edit z2r-test-voice-bot   # добавить в [Service]: User=zenith-sandbox
+
+# узкий sudoers, только на этот скрипт
+echo 'zenith-sandbox ALL=(root) NOPASSWD: /opt/z2r_autobench/Zenith/sandbox/start_sandbox.sh' \
+  | sudo tee /etc/sudoers.d/zenith-sandbox-voice-bot
+
+sudo systemctl restart z2r-test-voice-bot
+```
+
+## Интеграция с Zenith
+
+Zenith (`orchestrator/voice_tester.py`) дёргает этот же бот через
+локальный HTTP (`POST http://127.0.0.1:8765/probe`,
+`{"lua_desync_lines": ["--lua-desync=..."]}`) — не создаёт свой Discord-
+токен/приложение. Порт настраивается `ZENITH_PROBE_HOST`/
+`ZENITH_PROBE_PORT` в `.env`, слушает только `127.0.0.1` по умолчанию,
+наружу не выставлять.
 
 ## Установка
 
@@ -37,11 +87,11 @@ pip install "discord.py[voice]"   # для голосовых соединени
    - `OWNER_USER_ID` — твой Discord user ID, куда слать ЛС
    - `HOLD_SECONDS`, `CONNECT_TIMEOUT`, `STRATEGY_SWITCH_DELAY` — при
      желании подстрой под себя (дефолты разумные)
+   - `ZAPRET_CONFIG_PATH`/`ZENITH_SANDBOX_DIR`/`ZENITH_PROBE_HOST`/
+     `ZENITH_PROBE_PORT` — обычно дефолты подходят, менять только если
+     Zenith установлен не рядом со стандартным путём.
 
-2. `cp config/strategies.example.yaml config/strategies.yaml` и впиши
-   реальные команды твоего скрипта переключения стратегий в `apply_cmd`.
-
-3. Чтобы бот мог писать тебе в ЛС — у тебя должны быть открыты личные
+2. Чтобы бот мог писать тебе в ЛС — у тебя должны быть открыты личные
    сообщения от участников этого сервера (Settings -> Privacy -> Allow
    direct messages from server members), иначе Discord это заблокирует.
 

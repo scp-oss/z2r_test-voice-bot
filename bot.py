@@ -8,6 +8,15 @@ Discord-бот для тестирования стратегий zapret2 (VOICE
 рассинхронизацию после обновления стратегий в самом z2r (пункт 5 меню и т.п.)
 — не нужно ничего перегенерировать вручную.
 
+С 2026-08-07 бот работает от имени юзера zenith-sandbox (см. README) и
+тестирует ЧЕРЕЗ ПЕСОЧНИЦУ Zenith (изолированный nfqws2), а не напрямую
+через боевой locked.tsv, как раньше -- один процесс/юзер не может одной
+частью трафика идти в прод, другой в песочницу (iptables матчит по
+юзеру целиком), а песочница нужна, чтобы Zenith мог гонять через ЭТОТ
+ЖЕ бот свои непроверенные сгенерированные геномы, не трогая прод. Номер
+стратегии по-прежнему читается из /opt/zapret2/config (extract_strategy_lines),
+просто применяется в конфиг песочницы вместо set_strategy_cli.sh set.
+
 Сценарий:
   1. /voice_test <strategy>     — применить стратегию, зайти в тестовый
                                    голосовой канал, продержать соединение
@@ -24,6 +33,11 @@ Discord-бот для тестирования стратегий zapret2 (VOICE
                                    (нужно после ручных изменений в z2r,
                                    пока бот уже запущен).
   7. /voice_leave                — аварийный выход бота из войса руками.
+
+Плюс локальный HTTP (127.0.0.1 по умолчанию) -- POST /probe с
+{"lua_desync_lines": [...]} -- для Zenith orchestrator/voice_tester.py.
+Отдельного Discord-токена/бота Zenith'у для этого не нужно, дёргает уже
+залогиненный этот процесс.
 """
 
 import asyncio
@@ -33,6 +47,7 @@ import time
 from dataclasses import dataclass, field
 
 import discord
+from aiohttp import web
 from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
@@ -54,6 +69,29 @@ HOLD_SECONDS = int(os.environ.get("HOLD_SECONDS", "5"))            # сколь�
 CONNECT_TIMEOUT = int(os.environ.get("CONNECT_TIMEOUT", "15"))     # таймаут на сам connect()
 STRATEGY_SWITCH_DELAY = int(os.environ.get("STRATEGY_SWITCH_DELAY", "5"))  # пауза между стратегиями
 
+# --- песочница Zenith (замена прямого apply_cmd в locked.tsv, см. докстринг) ---
+ZAPRET_CONFIG_PATH = os.environ.get("ZAPRET_CONFIG_PATH", "/opt/zapret2/config")
+ZENITH_SANDBOX_DIR = os.environ.get("ZENITH_SANDBOX_DIR", "/opt/z2r_autobench/Zenith/sandbox")
+ZENITH_SANDBOX_CONF = os.path.join(ZENITH_SANDBOX_DIR, "nfqws2_sandbox.conf")
+ZENITH_START_SCRIPT = os.path.join(ZENITH_SANDBOX_DIR, "start_sandbox.sh")
+
+# Тот же фильтр, что genome.PROFILE_FILTERS["VOICE_UDP"] в Zenith -- сверено
+# построчно с /opt/zapret2/config, см. Zenith/orchestrator/genome.py. Держим
+# копией, а не общим импортом -- два независимо разворачиваемых репозитория.
+VOICE_FILTER_LINES = [
+    "--filter-udp=443,2053,2083,2087,2096,8443,50000-50099,1400,3478-3481,5349,19294-19344",
+    "--filter-l7=discord,stun",
+    "--payload=discord_ip_discovery,stun",
+]
+_SANDBOX_REWRITE_PREFIXES = (
+    "--filter-tcp=", "--filter-udp=", "--filter-l7=",
+    "--hostlist=", "--hostlist-exclude=", "--hostlist-domains=",
+    "--payload=", "--lua-desync=",
+)
+
+ZENITH_PROBE_HOST = os.environ.get("ZENITH_PROBE_HOST", "127.0.0.1")
+ZENITH_PROBE_PORT = int(os.environ.get("ZENITH_PROBE_PORT", "8765"))
+
 # Лог результатов в TSV, аналогичный по духу rank_strategies.sh/rank_quic.sh
 # (pass, strategy, attempt, success, метрика), но метрика тут — время
 # подключения в мс (меньше = лучше, в отличие от bytes у остальных тестов,
@@ -69,7 +107,7 @@ log = logging.getLogger("zapret-voice-bot")
 class Strategy:
     name: str
     description: str
-    apply_cmd: str
+    strategy_n: int
 
 
 @dataclass
@@ -122,7 +160,9 @@ async def query_max_strategy(profile: str) -> int | None:
 
 
 async def build_strategies() -> dict[str, Strategy]:
-    """Строит список стратегий на лету по актуальному числу от z2r."""
+    """Строит список стратегий на лету по актуальному числу от z2r.
+    query_max_strategy -- только чтение (config_profile_max_strategy),
+    locked.tsv не трогает."""
     max_voice = await query_max_strategy(VOICE_PROFILE)
     if max_voice is None:
         log.warning("Не удалось определить число стратегий VOICE_UDP, список будет пуст.")
@@ -130,25 +170,72 @@ async def build_strategies() -> dict[str, Strategy]:
     result: dict[str, Strategy] = {}
     for s in range(1, max_voice + 1):
         name = f"voice_{s}"
-        result[name] = Strategy(
-            name=name,
-            description=f"VOICE_UDP={s}",
-            apply_cmd=f"sudo bash {SET_STRATEGY_CLI} set {VOICE_PROFILE} {VOICE_PROTO} {s}",
-        )
+        result[name] = Strategy(name=name, description=f"VOICE_UDP={s}", strategy_n=s)
     return result
 
 
-async def run_apply_cmd(cmd: str) -> tuple[bool, str]:
-    """Асинхронно выполняет команду переключения стратегии, не блокируя event loop."""
-    proc = await asyncio.create_subprocess_shell(
-        cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,
+def extract_strategy_lines(config_path: str, key: str, strategy_n: int) -> list[str]:
+    """Вытаскивает все --lua-desync=...:strategy=N инстансы (может быть
+    несколько на одну физическую строку конфига, разделены пробелом перед
+    следующим --lua-desync=) из блока, привязанного к
+    circular_locked:key={key}:proto=udp -- до ближайшей пустой строки/--new.
+    Та же ручная логика, которой в этой сессии вытаскивали control-геномы
+    для Zenith (grep -n -B/-A по /opt/zapret2/config), просто автоматом."""
+    try:
+        with open(config_path) as f:
+            lines = f.read().splitlines()
+    except FileNotFoundError:
+        return []
+
+    marker = f"circular_locked:key={key}:proto=udp"
+    start = None
+    for i, line in enumerate(lines):
+        if marker in line:
+            start = i
+            break
+    if start is None:
+        return []
+
+    tag = f":strategy={strategy_n}"
+    result: list[str] = []
+    for line in lines[start + 1:]:
+        stripped = line.strip()
+        if stripped == "" or stripped == "--new":
+            break
+        for token in stripped.split(" --lua-desync="):
+            token = token if token.startswith("--lua-desync=") else "--lua-desync=" + token
+            if tag in token and (token.endswith(tag) or f"{tag}:" in token):
+                result.append(token)
+    return result
+
+
+def apply_to_sandbox(lua_lines: list[str]) -> tuple[bool, str]:
+    """То же самое, что sandbox_apply.apply_raw() в Zenith -- переписывает
+    только строки фильтра/--lua-desync= в конфиге песочницы, перезапускает
+    её через start_sandbox.sh. Не трогает /opt/zapret2 вообще (в отличие от
+    старого apply_cmd=set_strategy_cli.sh set, который менял боевой
+    locked.tsv)."""
+    try:
+        with open(ZENITH_SANDBOX_CONF) as f:
+            existing = f.readlines()
+    except FileNotFoundError:
+        return False, f"{ZENITH_SANDBOX_CONF} не найден -- запусти Zenith/sandbox/start_sandbox.sh хотя бы раз вручную"
+
+    kept = [ln for ln in existing if not ln.strip().startswith(_SANDBOX_REWRITE_PREFIXES)]
+    for line in VOICE_FILTER_LINES:
+        kept.append(line + "\n")
+    for line in lua_lines:
+        kept.append(line + "\n")
+
+    with open(ZENITH_SANDBOX_CONF, "w") as f:
+        f.writelines(kept)
+
+    import subprocess
+    result = subprocess.run(
+        ["sudo", ZENITH_START_SCRIPT],
+        capture_output=True, text=True, timeout=15,
     )
-    stdout, _ = await proc.communicate()
-    output = stdout.decode(errors="replace").strip()
-    ok = proc.returncode == 0
-    return ok, output
+    return result.returncode == 0, (result.stdout + result.stderr).strip()
 
 
 @dataclass
@@ -200,7 +287,13 @@ async def test_voice_connection(guild: discord.Guild, channel: discord.VoiceChan
 async def run_voice_test(strategy_name: str) -> VoiceTestResult:
     strat = state.strategies[strategy_name]
 
-    apply_ok, apply_output = await run_apply_cmd(strat.apply_cmd)
+    lua_lines = extract_strategy_lines(ZAPRET_CONFIG_PATH, VOICE_PROFILE, strat.strategy_n)
+    if not lua_lines:
+        apply_ok, apply_output = False, f"strategy={strat.strategy_n} не найдена в {ZAPRET_CONFIG_PATH} (блок key={VOICE_PROFILE})"
+    else:
+        loop = asyncio.get_running_loop()
+        apply_ok, apply_output = await loop.run_in_executor(None, apply_to_sandbox, lua_lines)
+
     state.current_strategy = strat.name
     state.last_apply_ok = apply_ok
     state.last_apply_output = apply_output
@@ -275,6 +368,52 @@ async def notify(result_embed_obj: discord.Embed, invoker: discord.abc.User | No
             log.warning("Ошибка отправки ЛС %s: %s", uid, e)
 
 
+async def handle_probe(request: web.Request) -> web.Response:
+    """POST /probe {"lua_desync_lines": ["--lua-desync=..."]} -- для
+    Zenith orchestrator/voice_tester.py. Тот же путь, что и слэш-команды
+    (apply_to_sandbox + test_voice_connection), только геном приходит
+    готовым от вызывающего, а не берётся из /opt/zapret2/config по
+    номеру -- Zenith тестирует ещё не существующие там геномы."""
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"success": False, "connect_ms": 0, "note": "invalid JSON body"}, status=400)
+
+    lua_lines = body.get("lua_desync_lines")
+    if not lua_lines or not isinstance(lua_lines, list):
+        return web.json_response({"success": False, "connect_ms": 0, "note": "missing lua_desync_lines (list)"}, status=400)
+
+    loop = asyncio.get_running_loop()
+    apply_ok, apply_output = await loop.run_in_executor(None, apply_to_sandbox, lua_lines)
+    if not apply_ok:
+        return web.json_response({"success": False, "connect_ms": 0, "note": f"apply failed: {apply_output}"})
+
+    guild = bot.get_guild(GUILD_ID)
+    if guild is None:
+        return web.json_response({"success": False, "connect_ms": 0, "note": "guild not cached yet, бот ещё стартует"})
+    channel = guild.get_channel(TEST_VOICE_CHANNEL_ID)
+    if channel is None:
+        return web.json_response({"success": False, "connect_ms": 0, "note": f"канал {TEST_VOICE_CHANNEL_ID} не найден"})
+
+    hold_ok, hold_note, connect_time = await test_voice_connection(guild, channel)
+    connect_failed = hold_note.startswith("connect() не удался")
+    return web.json_response({
+        "success": hold_ok and not connect_failed,
+        "connect_ms": int(connect_time * 1000),
+        "note": hold_note,
+    })
+
+
+async def start_probe_server():
+    app = web.Application()
+    app.router.add_post("/probe", handle_probe)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, ZENITH_PROBE_HOST, ZENITH_PROBE_PORT)
+    await site.start()
+    log.info("Zenith probe HTTP слушает %s:%d (POST /probe)", ZENITH_PROBE_HOST, ZENITH_PROBE_PORT)
+
+
 class ZapretBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
@@ -289,6 +428,7 @@ class ZapretBot(commands.Bot):
         self.tree.copy_global_to(guild=guild)
         await self.tree.sync(guild=guild)
         log.info("Slash-команды синхронизированы для guild %s", GUILD_ID)
+        await start_probe_server()
 
 
 bot = ZapretBot()
