@@ -50,8 +50,13 @@ Discord-бот для проверки стратегий zapret2 (`VOICE_UDP`, 
 иногда дропает исходный пакет вместо чистого пропуска. У
 `zenith-voice-bot` — узкое правило ТОЛЬКО на конкретные UDP-порты
 голосового профиля, обычный HTTPS-трафик бота его вообще не касается.
-И ему нужны права перезапускать `Zenith/sandbox/start_sandbox.sh` (сам
-скрипт требует root):
+И ему нужны права перезапускать `Zenith/sandbox/start_sandbox.sh`, а
+также ПЕРЕЗАПИСЫВАТЬ `nfqws2_sandbox.conf` через `Zenith/sandbox/
+write_conf.sh` — сам конфиг обычно root-owned (пересоздаётся, когда
+Zenith'овский `orchestrator/main.py` работает через `sudo` для
+TCP-профилей), у непривилегированного `zenith-voice-bot` нет прав
+писать в него напрямую (живая ошибка `PermissionError` при первом
+`/probe` — оба скрипта требуют root):
 
 ```bash
 # создаёт юзеров zenith-sandbox И zenith-voice-bot, ставит оба правила
@@ -60,9 +65,12 @@ sudo /opt/z2r_autobench/Zenith/sandbox/setup_sandbox.sh
 # systemd-юнит бота — на юзера zenith-voice-bot
 sudo systemctl edit z2r-test-voice-bot   # добавить в [Service]: User=zenith-voice-bot
 
-# узкий sudoers, только на этот скрипт
-echo 'zenith-voice-bot ALL=(root) NOPASSWD: /opt/z2r_autobench/Zenith/sandbox/start_sandbox.sh' \
-  | sudo tee /etc/sudoers.d/zenith-voice-bot
+# узкий sudoers, только на эти два скрипта
+{
+  echo 'zenith-voice-bot ALL=(root) NOPASSWD: /opt/z2r_autobench/Zenith/sandbox/start_sandbox.sh'
+  echo 'zenith-voice-bot ALL=(root) NOPASSWD: /opt/z2r_autobench/Zenith/sandbox/write_conf.sh'
+} | sudo tee /etc/sudoers.d/zenith-voice-bot
+sudo chmod 440 /etc/sudoers.d/zenith-voice-bot
 
 sudo systemctl restart z2r-test-voice-bot
 ```

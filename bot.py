@@ -84,6 +84,7 @@ ZAPRET_CONFIG_PATH = os.environ.get("ZAPRET_CONFIG_PATH", "/opt/zapret2/config")
 ZENITH_SANDBOX_DIR = os.environ.get("ZENITH_SANDBOX_DIR", "/opt/z2r_autobench/Zenith/sandbox")
 ZENITH_SANDBOX_CONF = os.path.join(ZENITH_SANDBOX_DIR, "nfqws2_sandbox.conf")
 ZENITH_START_SCRIPT = os.path.join(ZENITH_SANDBOX_DIR, "start_sandbox.sh")
+ZENITH_WRITE_CONF_SCRIPT = os.path.join(ZENITH_SANDBOX_DIR, "write_conf.sh")
 
 # Тот же фильтр, что genome.PROFILE_FILTERS["VOICE_UDP"] в Zenith -- сверено
 # построчно с /opt/zapret2/config, см. Zenith/orchestrator/genome.py. Держим
@@ -237,10 +238,19 @@ def apply_to_sandbox(lua_lines: list[str]) -> tuple[bool, str]:
     for line in lua_lines:
         kept.append(line + "\n")
 
-    with open(ZENITH_SANDBOX_CONF, "w") as f:
-        f.writelines(kept)
-
     import subprocess
+
+    # Пишем через root-скрипт, не open() напрямую -- конфиг обычно
+    # root-owned (пересоздаётся Zenith'овским main.py через sudo), у
+    # zenith-voice-bot нет прав писать в него иначе. Тот же паттерн, что
+    # уже есть для start_sandbox.sh (тоже требует root).
+    write_result = subprocess.run(
+        ["sudo", ZENITH_WRITE_CONF_SCRIPT],
+        input="".join(kept), capture_output=True, text=True, timeout=10,
+    )
+    if write_result.returncode != 0:
+        return False, f"не удалось записать конфиг: {(write_result.stdout + write_result.stderr).strip()}"
+
     result = subprocess.run(
         ["sudo", ZENITH_START_SCRIPT],
         capture_output=True, text=True, timeout=15,
