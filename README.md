@@ -40,21 +40,29 @@ Discord-бот для проверки стратегий zapret2 (`VOICE_UDP`, 
 конфиге z2r) геномы, не заводя отдельного токена — см. ниже.
 
 Отсюда требование: бот должен работать от системного юзера
-`zenith-sandbox` (тот же, что создаёт `Zenith/sandbox/setup_sandbox.sh`)
-— его исходящий UDP-трафик отдельно перехватывается узким iptables-
-правилом песочницы. И ему нужны права перезапускать
-`Zenith/sandbox/start_sandbox.sh` (сам скрипт требует root):
+`zenith-voice-bot`, СОЗДАВАЕМОГО `Zenith/sandbox/setup_sandbox.sh` — не
+от `zenith-sandbox` (тот у Zenith занят curl-проверками TCP-профилей).
+Живой инцидент 2026-08-07: у бота есть свой обычный TCP-трафик
+(Discord gateway/API логин), не связанный с тестированием, и он ЗАВИСАЛ,
+будучи пойман тем же широким TCP-правилом `zenith-sandbox` — `nfqws2`
+пытается реассемблировать TLS ClientHello даже без единого
+`--filter-tcp=` в конфиге, и в этом no-op режиме реассемблинг с replay
+иногда дропает исходный пакет вместо чистого пропуска. У
+`zenith-voice-bot` — узкое правило ТОЛЬКО на конкретные UDP-порты
+голосового профиля, обычный HTTPS-трафик бота его вообще не касается.
+И ему нужны права перезапускать `Zenith/sandbox/start_sandbox.sh` (сам
+скрипт требует root):
 
 ```bash
-# сгенерировать конфиг песочницы (если ещё не было) и убедиться, что она вообще работает
+# создаёт юзеров zenith-sandbox И zenith-voice-bot, ставит оба правила
 sudo /opt/z2r_autobench/Zenith/sandbox/setup_sandbox.sh
 
-# systemd-юнит бота — на юзера zenith-sandbox
-sudo systemctl edit z2r-test-voice-bot   # добавить в [Service]: User=zenith-sandbox
+# systemd-юнит бота — на юзера zenith-voice-bot
+sudo systemctl edit z2r-test-voice-bot   # добавить в [Service]: User=zenith-voice-bot
 
 # узкий sudoers, только на этот скрипт
-echo 'zenith-sandbox ALL=(root) NOPASSWD: /opt/z2r_autobench/Zenith/sandbox/start_sandbox.sh' \
-  | sudo tee /etc/sudoers.d/zenith-sandbox-voice-bot
+echo 'zenith-voice-bot ALL=(root) NOPASSWD: /opt/z2r_autobench/Zenith/sandbox/start_sandbox.sh' \
+  | sudo tee /etc/sudoers.d/zenith-voice-bot
 
 sudo systemctl restart z2r-test-voice-bot
 ```
