@@ -393,15 +393,36 @@ async def handle_probe(request: web.Request) -> web.Response:
     Zenith orchestrator/voice_tester.py. Тот же путь, что и слэш-команды
     (apply_to_sandbox + test_voice_connection), только геном приходит
     готовым от вызывающего, а не берётся из /opt/zapret2/config по
-    номеру -- Zenith тестирует ещё не существующие там геномы."""
+    номеру -- Zenith тестирует ещё не существующие там геномы.
+
+    Также принимает {"strategy_n": N} (добавлено для autotune_daemon.sh
+    в z2r_autobench, health-check/ретюн профиля 6 -- см. rank_voice.sh /
+    check_profile_voice()) -- то же самое, что вводит номер в слэш-команде
+    /voice_test, просто без Discord-взаимодействия: сам достаёт lua-строки
+    ИМЕННО ЭТОЙ стратегии из живого /opt/zapret2/config через
+    extract_strategy_lines(), тем же путём, что /voice_test. lua_desync_lines
+    и strategy_n взаимоисключающие -- ровно один из двух должен быть задан."""
     try:
         body = await request.json()
     except Exception:
         return web.json_response({"success": False, "connect_ms": 0, "note": "invalid JSON body"}, status=400)
 
     lua_lines = body.get("lua_desync_lines")
+    strategy_n = body.get("strategy_n")
+
+    if strategy_n is not None:
+        if lua_lines:
+            return web.json_response({"success": False, "connect_ms": 0, "note": "lua_desync_lines и strategy_n взаимоисключающие"}, status=400)
+        try:
+            strategy_n = int(strategy_n)
+        except (TypeError, ValueError):
+            return web.json_response({"success": False, "connect_ms": 0, "note": "strategy_n должен быть целым числом"}, status=400)
+        lua_lines = extract_strategy_lines(ZAPRET_CONFIG_PATH, VOICE_PROFILE, strategy_n)
+        if not lua_lines:
+            return web.json_response({"success": False, "connect_ms": 0, "note": f"strategy={strategy_n} не найдена в {ZAPRET_CONFIG_PATH} (блок key={VOICE_PROFILE})"})
+
     if not lua_lines or not isinstance(lua_lines, list):
-        return web.json_response({"success": False, "connect_ms": 0, "note": "missing lua_desync_lines (list)"}, status=400)
+        return web.json_response({"success": False, "connect_ms": 0, "note": "missing lua_desync_lines (list) or strategy_n"}, status=400)
 
     loop = asyncio.get_running_loop()
     apply_ok, apply_output = await loop.run_in_executor(None, apply_to_sandbox, lua_lines)
