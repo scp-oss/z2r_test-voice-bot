@@ -124,6 +124,8 @@ class Strategy:
 @dataclass
 class BotState:
     strategies: dict[str, Strategy] = field(default_factory=dict)
+    strategies_error: str = ""
+    startup_alert_sent: bool = False
     current_strategy: str | None = None
     last_apply_ok: bool | None = None
     last_apply_output: str = ""
@@ -148,41 +150,62 @@ def log_voice_result(pass_num: int, strategy: str, attempt: int, result: "VoiceT
         )
 
 
-async def query_max_strategy(profile: str) -> int | None:
+async def query_max_strategy(profile: str) -> tuple[int | None, str]:
     """Спрашивает у z2r (через set_strategy_cli.sh max) актуальное число
     стратегий профиля — ту же config_profile_max_strategy(), которой
     пользуется остальная автоматика (rank_strategies.sh и т.п.). Так список
     стратегий бота никогда не рассинхронизируется со статическим файлом,
-    потому что статического файла со списком стратегий просто нет."""
+    потому что статического файла со списком стратегий просто нет.
+
+    Возвращает (число, "") при успехе или (None, причина) при провале —
+    причина пробрасывается наружу вместо того, чтобы теряться в локальном
+    логе, см. build_strategies()."""
     proc = await asyncio.create_subprocess_exec(
         "sudo", "bash", SET_STRATEGY_CLI, "max", profile,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
     stdout, stderr = await proc.communicate()
+    stderr_text = stderr.decode(errors="replace").strip()
     if proc.returncode != 0:
-        log.error("Не удалось получить max_strategy для profile=%s: %s", profile, stderr.decode(errors="replace"))
-        return None
+        err = f"{SET_STRATEGY_CLI} max {profile} завершился с кодом {proc.returncode}: {stderr_text or '(stderr пуст)'}"
+        log.error(err)
+        return None, err
     text = stdout.decode(errors="replace").strip()
     if not text.isdigit():
-        log.error("Неожиданный вывод max_strategy для profile=%s: %r", profile, text)
-        return None
-    return int(text)
+        err = f"неожиданный вывод max_strategy для profile={profile}: {text!r} (stderr: {stderr_text or 'пуст'})"
+        log.error(err)
+        return None, err
+    return int(text), ""
 
 
-async def build_strategies() -> dict[str, Strategy]:
+async def build_strategies() -> tuple[dict[str, Strategy], str]:
     """Строит список стратегий на лету по актуальному числу от z2r.
     query_max_strategy -- только чтение (config_profile_max_strategy),
-    locked.tsv не трогает."""
-    max_voice = await query_max_strategy(VOICE_PROFILE)
+    locked.tsv не трогает. Возвращает (словарь, "") при успехе или
+    ({}, причина) при провале."""
+    max_voice, err = await query_max_strategy(VOICE_PROFILE)
     if max_voice is None:
-        log.warning("Не удалось определить число стратегий VOICE_UDP, список будет пуст.")
-        return {}
+        log.warning("Не удалось определить число стратегий VOICE_UDP, список будет пуст: %s", err)
+        return {}, err
     result: dict[str, Strategy] = {}
     for s in range(1, max_voice + 1):
         name = f"voice_{s}"
         result[name] = Strategy(name=name, description=f"VOICE_UDP={s}", strategy_n=s)
-    return result
+    return result, ""
+
+
+async def ensure_strategies_loaded() -> bool:
+    """Если список стратегий пуст (например из-за сбоя при старте),
+    перед тем как отказывать пользователю пробует перечитать его у z2r
+    ещё раз -- тот же build_strategies(), что и /refresh_strategies,
+    просто без ручного вызова команды. Возвращает True, если список
+    не пуст после попытки."""
+    if state.strategies:
+        return True
+    log.info("Список стратегий пуст, пробую автоматически перечитать перед выполнением команды...")
+    state.strategies, state.strategies_error = await build_strategies()
+    return bool(state.strategies)
 
 
 def extract_strategy_lines(config_path: str, key: str, strategy_n: int) -> list[str]:
@@ -463,8 +486,10 @@ class ZapretBot(commands.Bot):
         super().__init__(command_prefix="!", intents=intents)
 
     async def setup_hook(self):
-        state.strategies = await build_strategies()
+        state.strategies, state.strategies_error = await build_strategies()
         log.info("Загружено стратегий: %d (динамически, из z2r config)", len(state.strategies))
+        if not state.strategies:
+            log.error("Бот стартует с ПУСТЫМ списком стратегий VOICE_UDP: %s", state.strategies_error)
         guild = discord.Object(id=GUILD_ID)
         self.tree.copy_global_to(guild=guild)
         try:
@@ -491,9 +516,12 @@ def strategy_choices() -> list[app_commands.Choice[str]]:
 
 @bot.tree.command(description="Показать текущий список стратегий VOICE_UDP")
 async def strategy_list(interaction: discord.Interaction):
-    if not state.strategies:
+    if not await ensure_strategies_loaded():
         await interaction.response.send_message(
-            "Стратегии не загружены — проверь sudo-права set_strategy_cli.sh и доступность zapret2.", ephemeral=True
+            f"Стратегии не загружены: {state.strategies_error or 'см. логи'}\n"
+            f"Попытка автоматически перечитать тоже не удалась -- проверь sudo-права "
+            f"{SET_STRATEGY_CLI} и доступность zapret2, либо запусти /refresh_strategies вручную.",
+            ephemeral=True,
         )
         return
     lines = []
@@ -508,11 +536,12 @@ async def strategy_list(interaction: discord.Interaction):
 async def refresh_strategies(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     old_count = len(state.strategies)
-    state.strategies = await build_strategies()
+    state.strategies, state.strategies_error = await build_strategies()
     new_count = len(state.strategies)
-    await interaction.followup.send(
-        f"Обновлено: было {old_count} стратегий, стало {new_count}.", ephemeral=True
-    )
+    msg = f"Обновлено: было {old_count} стратегий, стало {new_count}."
+    if new_count == 0:
+        msg += f"\nПричина: {state.strategies_error or 'см. логи бота'}"
+    await interaction.followup.send(msg, ephemeral=True)
 
 
 @bot.tree.command(description="Статус последней применённой стратегии")
@@ -535,6 +564,8 @@ async def strategy_status(interaction: discord.Interaction):
 @bot.tree.command(description="Применить стратегию, зайти в тестовый канал и написать результат в ЛС")
 @app_commands.describe(name="Название стратегии из strategy_list")
 async def voice_test(interaction: discord.Interaction, name: str):
+    if not state.strategies:
+        await ensure_strategies_loaded()
     if name not in state.strategies:
         await interaction.response.send_message(f"Нет такой стратегии: `{name}`. Смотри /strategy_list", ephemeral=True)
         return
@@ -557,8 +588,13 @@ async def voice_test_autocomplete(interaction: discord.Interaction, current: str
 
 @bot.tree.command(description="Прогнать ВСЕ стратегии по очереди (1 раз) и прислать сводку в ЛС")
 async def voice_test_all(interaction: discord.Interaction):
-    if not state.strategies:
-        await interaction.response.send_message("Стратегии не загружены. Попробуй /refresh_strategies.", ephemeral=True)
+    if not await ensure_strategies_loaded():
+        await interaction.response.send_message(
+            f"Стратегии не загружены: {state.strategies_error or 'см. логи'}\n"
+            f"Попытка автоматически перечитать тоже не удалась -- проверь sudo-права "
+            f"{SET_STRATEGY_CLI} и доступность zapret2, либо запусти /refresh_strategies вручную.",
+            ephemeral=True,
+        )
         return
 
     await interaction.response.send_message(
@@ -600,8 +636,13 @@ async def voice_test_all(interaction: discord.Interaction):
 @bot.tree.command(description="Многопроходный прогон ВСЕХ стратегий (аналог rank_strategies.sh --passes)")
 @app_commands.describe(passes="Сколько раз прогнать полный набор стратегий (по умолчанию 3)")
 async def voice_rank(interaction: discord.Interaction, passes: int = 3):
-    if not state.strategies:
-        await interaction.response.send_message("Стратегии не загружены. Попробуй /refresh_strategies.", ephemeral=True)
+    if not await ensure_strategies_loaded():
+        await interaction.response.send_message(
+            f"Стратегии не загружены: {state.strategies_error or 'см. логи'}\n"
+            f"Попытка автоматически перечитать тоже не удалась -- проверь sudo-права "
+            f"{SET_STRATEGY_CLI} и доступность zapret2, либо запусти /refresh_strategies вручную.",
+            ephemeral=True,
+        )
         return
     if passes < 1 or passes > 10:
         await interaction.response.send_message("passes должен быть от 1 до 10 (иначе тест займёт слишком много времени).", ephemeral=True)
@@ -685,6 +726,14 @@ async def voice_leave(interaction: discord.Interaction):
 @bot.event
 async def on_ready():
     log.info("Бот запущен как %s (id=%s)", bot.user, bot.user.id)
+    if not state.strategies and not state.startup_alert_sent:
+        state.startup_alert_sent = True
+        embed = discord.Embed(
+            title="⚠️ Стратегии VOICE_UDP не загружены при старте",
+            description=state.strategies_error or "неизвестная причина, см. логи бота",
+            color=discord.Color.red(),
+        )
+        await notify(embed, None)
 
 
 if __name__ == "__main__":
