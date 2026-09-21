@@ -44,6 +44,13 @@ sandbox/setup_sandbox.sh), обычный HTTPS-трафик бота его н�
                                    пока бот уже запущен).
   7. /voice_leave                — аварийный выход бота из войса руками.
 
+Плюс автоматический фоновый цикл auto_voice_check (см.
+AUTO_CHECK_INTERVAL_HOURS/AUTO_CHECK_PASSES) -- та же логика, что
+/voice_rank, только сам по расписанию, без ручной команды; отчёт уходит
+владельцу в ЛС тем же notify(). Прямого способа доставить результат
+куда-то ещё, кроме Discord (например, в чат с Claude), у бота нет --
+отчёт нужно переслать вручную, если требуется его куда-то передать.
+
 Плюс локальный HTTP (127.0.0.1 по умолчанию) -- POST /probe с
 {"lua_desync_lines": [...]} -- для Zenith orchestrator/voice_tester.py.
 Отдельного Discord-токена/бота Zenith'у для этого не нужно, дёргает уже
@@ -59,7 +66,7 @@ from dataclasses import dataclass, field
 import discord
 from aiohttp import web
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -78,6 +85,16 @@ VOICE_PROTO = os.environ.get("VOICE_PROTO", "udp")
 HOLD_SECONDS = int(os.environ.get("HOLD_SECONDS", "5"))            # сколько держим соединение перед тем как считать успехом
 CONNECT_TIMEOUT = int(os.environ.get("CONNECT_TIMEOUT", "15"))     # таймаут на сам connect()
 STRATEGY_SWITCH_DELAY = int(os.environ.get("STRATEGY_SWITCH_DELAY", "5"))  # пауза между стратегиями
+
+# Автоматический периодический прогон ВСЕХ стратегий без ручной команды --
+# та же логика, что /voice_rank (run_check_sweep/build_check_summary ниже),
+# просто по расписанию вместо ручного вызова. Отчёт уходит тем же notify()
+# в ЛС владельцу, что и у ручных команд -- отдельного публичного канала/
+# вебхука не заводим, у этого бота и так нет способа доставить результат
+# куда-то ещё, кроме Discord. AUTO_CHECK_INTERVAL_HOURS<=0 отключает цикл
+# полностью (полезно на серверах, где раньше бота ставили без этого).
+AUTO_CHECK_INTERVAL_HOURS = float(os.environ.get("AUTO_CHECK_INTERVAL_HOURS", "6"))
+AUTO_CHECK_PASSES = int(os.environ.get("AUTO_CHECK_PASSES", "1"))
 
 # --- песочница Zenith (замена прямого apply_cmd в locked.tsv, см. докстринг) ---
 ZAPRET_CONFIG_PATH = os.environ.get("ZAPRET_CONFIG_PATH", "/opt/zapret2/config")
@@ -133,6 +150,14 @@ class BotState:
 
 
 state = BotState()
+
+# Сериализует ЛЮБОЙ прогон (ручные /voice_test, /voice_test_all,
+# /voice_rank и автоматический цикл auto_voice_check) -- все они по
+# очереди двигают ОДНУ и ту же песочницу Zenith и подключаются в ОДИН и
+# тот же тестовый голосовой канал; параллельный запуск двух прогонов
+# испортил бы оба одновременно выполняющихся теста, а не просто дал
+# неверный результат одному из них.
+_check_lock = asyncio.Lock()
 
 
 def log_voice_result(pass_num: int, strategy: str, attempt: int, result: "VoiceTestResult") -> None:
@@ -478,6 +503,37 @@ async def start_probe_server():
     log.info("Zenith probe HTTP слушает %s:%d (POST /probe)", ZENITH_PROBE_HOST, ZENITH_PROBE_PORT)
 
 
+# hours= требует положительное число даже когда цикл выключен
+# (AUTO_CHECK_INTERVAL_HOURS<=0) -- в этом случае подставляем заглушку и
+# просто никогда не вызываем .start() в setup_hook(), см. ниже.
+_AUTO_CHECK_LOOP_HOURS = AUTO_CHECK_INTERVAL_HOURS if AUTO_CHECK_INTERVAL_HOURS > 0 else 1.0
+
+
+@tasks.loop(hours=_AUTO_CHECK_LOOP_HOURS)
+async def auto_voice_check():
+    """Тот же прогон, что /voice_rank, только по расписанию -- см.
+    AUTO_CHECK_INTERVAL_HOURS/AUTO_CHECK_PASSES. Отчёт уходит владельцу в
+    ЛС тем же notify(), что и у ручных команд (invoker=None -- слать
+    больше некому, команду никто не вызывал)."""
+    if not await ensure_strategies_loaded():
+        log.warning("Автопроверка VOICE_UDP пропущена: список стратегий пуст (%s)", state.strategies_error)
+        return
+    log.info("Автопроверка VOICE_UDP: запускаю %d проход(ов)...", AUTO_CHECK_PASSES)
+    async with _check_lock:
+        await run_check_sweep(AUTO_CHECK_PASSES)
+    summary = build_check_summary(
+        AUTO_CHECK_PASSES,
+        title=f"🔁 Автопроверка VOICE_UDP — {AUTO_CHECK_PASSES} проход(ов), раз в {AUTO_CHECK_INTERVAL_HOURS:g}ч",
+    )
+    await notify(summary, None)
+    log.info("Автопроверка VOICE_UDP завершена")
+
+
+@auto_voice_check.before_loop
+async def before_auto_voice_check():
+    await bot.wait_until_ready()
+
+
 class ZapretBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
@@ -502,6 +558,14 @@ class ZapretBot(commands.Bot):
             # applications.commands, нужен новый инвайт с обоими scope.
             log.error("Не удалось синхронизировать slash-команды (не критично для Zenith): %s", e)
         await start_probe_server()
+        if AUTO_CHECK_INTERVAL_HOURS > 0:
+            auto_voice_check.start()
+            log.info(
+                "Автопроверка VOICE_UDP включена: раз в %gч, %d проход(ов)",
+                AUTO_CHECK_INTERVAL_HOURS, AUTO_CHECK_PASSES,
+            )
+        else:
+            log.info("Автопроверка VOICE_UDP отключена (AUTO_CHECK_INTERVAL_HOURS<=0)")
 
 
 bot = ZapretBot()
@@ -574,7 +638,8 @@ async def voice_test(interaction: discord.Interaction, name: str):
         f"Тестирую стратегию **{name}**: применяю конфиг, подключаюсь к голосовому каналу, "
         f"держу соединение {HOLD_SECONDS}s...", ephemeral=True
     )
-    result = await run_voice_test(name)
+    async with _check_lock:
+        result = await run_voice_test(name)
     log_voice_result(pass_num=1, strategy=name, attempt=1, result=result)
     embed = result_embed(result)
     await notify(embed, interaction.user)
@@ -605,13 +670,14 @@ async def voice_test_all(interaction: discord.Interaction):
 
     results: list[VoiceTestResult] = []
     names = list(state.strategies.keys())
-    for i, name in enumerate(names):
-        result = await run_voice_test(name)
-        log_voice_result(pass_num=1, strategy=name, attempt=1, result=result)
-        results.append(result)
-        await notify(result_embed(result), interaction.user)
-        if i < len(names) - 1:
-            await asyncio.sleep(STRATEGY_SWITCH_DELAY)
+    async with _check_lock:
+        for i, name in enumerate(names):
+            result = await run_voice_test(name)
+            log_voice_result(pass_num=1, strategy=name, attempt=1, result=result)
+            results.append(result)
+            await notify(result_embed(result), interaction.user)
+            if i < len(names) - 1:
+                await asyncio.sleep(STRATEGY_SWITCH_DELAY)
 
     summary_lines = []
     for r in results:
@@ -633,41 +699,26 @@ async def voice_test_all(interaction: discord.Interaction):
     await interaction.followup.send("Прогон завершён, сводка в ЛС.", ephemeral=True)
 
 
-@bot.tree.command(description="Многопроходный прогон ВСЕХ стратегий (аналог rank_strategies.sh --passes)")
-@app_commands.describe(passes="Сколько раз прогнать полный набор стратегий (по умолчанию 3)")
-async def voice_rank(interaction: discord.Interaction, passes: int = 3):
-    if not await ensure_strategies_loaded():
-        await interaction.response.send_message(
-            f"Стратегии не загружены: {state.strategies_error or 'см. логи'}\n"
-            f"Попытка автоматически перечитать тоже не удалась -- проверь sudo-права "
-            f"{SET_STRATEGY_CLI} и доступность zapret2, либо запусти /refresh_strategies вручную.",
-            ephemeral=True,
-        )
-        return
-    if passes < 1 or passes > 10:
-        await interaction.response.send_message("passes должен быть от 1 до 10 (иначе тест займёт слишком много времени).", ephemeral=True)
-        return
-
-    names = list(state.strategies.keys())
-    total = len(names) * passes
-    await interaction.response.send_message(
-        f"Запускаю {passes} проход(ов) по {len(names)} стратегиям ({total} тестов, "
-        f"по ~{HOLD_SECONDS + STRATEGY_SWITCH_DELAY}s каждый — это надолго). "
-        f"Промежуточные результаты НЕ шлю в ЛС (иначе будет спам), только финальную сводку "
-        f"и полный TSV-лог: {VOICE_RAW_FILE}",
-        ephemeral=True,
-    )
-
+async def run_check_sweep(passes: int, names: list[str] | None = None) -> None:
+    """Гоняет все стратегии VOICE_UDP passes раз подряд, логируя каждый
+    результат через log_voice_result() -- общее тело для /voice_rank и
+    автоматического периодического цикла (auto_voice_check). Вызывающий
+    обязан держать _check_lock снаружи (обе точки вызова это делают)."""
+    strategy_names = names if names is not None else list(state.strategies.keys())
     for p in range(1, passes + 1):
-        for i, name in enumerate(names):
+        for i, name in enumerate(strategy_names):
             result = await run_voice_test(name)
             log_voice_result(pass_num=p, strategy=name, attempt=1, result=result)
-            if not (i == len(names) - 1 and p == passes):
+            if not (i == len(strategy_names) - 1 and p == passes):
                 await asyncio.sleep(STRATEGY_SWITCH_DELAY)
-        log.info("voice_rank: проход %d/%d завершён", p, passes)
+        log.info("check sweep: проход %d/%d завершён", p, passes)
 
-    # Агрегация прямо в Python — не полагаемся на внешний awk, чтобы
-    # результат можно было сразу прислать в Discord.
+
+def build_check_summary(passes: int, title: str) -> discord.Embed:
+    """Агрегирует VOICE_RAW_FILE за последние `passes` проходов в
+    рейтинг-эмбед -- общее тело для /voice_rank и auto_voice_check.
+    Не полагаемся на внешний awk, чтобы результат можно было сразу
+    прислать в Discord."""
     stats: dict[str, dict] = {}
     try:
         with open(VOICE_RAW_FILE, "r", encoding="utf-8") as f:
@@ -702,13 +753,45 @@ async def voice_rank(interaction: discord.Interaction, passes: int = 3):
     failed = [s for s, st in stats.items() if st["success"] == 0]
 
     summary = discord.Embed(
-        title=f"Рейтинг VOICE_UDP — {passes} проход(ов)",
+        title=title,
         description="\n".join(lines) if lines else "Ни одна стратегия не сработала ни разу.",
         color=discord.Color.green() if lines else discord.Color.red(),
     )
     if failed:
         summary.add_field(name="Провалились полностью", value=", ".join(failed)[:1000], inline=False)
     summary.add_field(name="Полный лог", value=f"`{VOICE_RAW_FILE}`", inline=False)
+    return summary
+
+
+@bot.tree.command(description="Многопроходный прогон ВСЕХ стратегий (аналог rank_strategies.sh --passes)")
+@app_commands.describe(passes="Сколько раз прогнать полный набор стратегий (по умолчанию 3)")
+async def voice_rank(interaction: discord.Interaction, passes: int = 3):
+    if not await ensure_strategies_loaded():
+        await interaction.response.send_message(
+            f"Стратегии не загружены: {state.strategies_error or 'см. логи'}\n"
+            f"Попытка автоматически перечитать тоже не удалась -- проверь sudo-права "
+            f"{SET_STRATEGY_CLI} и доступность zapret2, либо запусти /refresh_strategies вручную.",
+            ephemeral=True,
+        )
+        return
+    if passes < 1 or passes > 10:
+        await interaction.response.send_message("passes должен быть от 1 до 10 (иначе тест займёт слишком много времени).", ephemeral=True)
+        return
+
+    names = list(state.strategies.keys())
+    total = len(names) * passes
+    await interaction.response.send_message(
+        f"Запускаю {passes} проход(ов) по {len(names)} стратегиям ({total} тестов, "
+        f"по ~{HOLD_SECONDS + STRATEGY_SWITCH_DELAY}s каждый — это надолго). "
+        f"Промежуточные результаты НЕ шлю в ЛС (иначе будет спам), только финальную сводку "
+        f"и полный TSV-лог: {VOICE_RAW_FILE}",
+        ephemeral=True,
+    )
+
+    async with _check_lock:
+        await run_check_sweep(passes, names)
+
+    summary = build_check_summary(passes, title=f"Рейтинг VOICE_UDP — {passes} проход(ов)")
     await notify(summary, interaction.user)
     await interaction.followup.send("Прогон завершён, рейтинг отправлен в ЛС.", ephemeral=True)
 
