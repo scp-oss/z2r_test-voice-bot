@@ -124,10 +124,15 @@ pip install "discord.py[voice]"   # для голосовых соединени
 ## Права бота при инвайте (OAuth2 URL Generator)
 
 Scopes: `bot`, `applications.commands`
-Bot Permissions: `View Channels`, `Connect`, `Move Members` (на будущее)
+Bot Permissions: `View Channels`, `Connect`, `Move Members` (на будущее),
+`Manage Channels`
 
-Manage Channels **не нужен** — канал фиксированный, бот его не создаёт
-и не удаляет.
+Manage Channels нужен с 2026-10-08 — без создания/удаления канала (он
+по-прежнему фиксированный), а чтобы переключать его `rtc_region` перед
+тестом (параметр `region` в POST /probe, см. handle_probe в bot.py) --
+без этого права `channel.edit(rtc_region=...)` падает с 403 Missing
+Permissions. Если регион тебе не нужен (всегда "auto"), право можно не
+выдавать -- старое поведение без параметра region сохранено как было.
 
 ## Запуск
 

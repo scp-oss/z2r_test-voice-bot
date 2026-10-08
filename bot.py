@@ -51,6 +51,7 @@ sandbox/setup_sandbox.sh), обычный HTTPS-трафик бота его н�
 """
 
 import asyncio
+import json
 import logging
 import os
 import time
@@ -411,6 +412,52 @@ async def notify(result_embed_obj: discord.Embed, invoker: discord.abc.User | No
             log.warning("Ошибка отправки ЛС %s: %s", uid, e)
 
 
+# Регионы голосовых серверов Discord (rtc_region канала), как они
+# показаны в клиенте при ручном выборе региона голосового канала.
+# None/"auto" -- автовыбор (как было раньше, единственный режим до
+# добавления параметра "region" в /probe). Нужны, т.к. RKN может душить
+# по-разному в зависимости от того, в какой регион реально улетает UDP --
+# один канал с фиксированным TEST_VOICE_CHANNEL_ID раньше проверял только
+# тот регион, который Discord выбрал ему автоматически (обычно ближайший
+# к серверу бота), и ничего не говорил про остальные.
+VALID_RTC_REGIONS = {
+    "brazil", "hongkong", "india", "japan", "rotterdam", "singapore",
+    "southafrica", "sydney", "us-central", "us-east", "us-south", "us-west",
+}
+
+# На гильдии уже заранее созданы отдельные голосовые каналы "CDN <регион>"
+# с нужным rtc_region, выставленным руками (см. скриншот в чате
+# 2026-10-08) -- так проще и надёжнее, чем дёргать channel.edit(rtc_region=)
+# на лету: не нужен Manage Channels (у бота его и не было -- первая
+# попытка динамического переключения упала с 403 Missing Permissions,
+# см. git history), и не нужна пауза на распространение смены региона.
+# Если канал для региона есть в этой карте -- используем его id напрямую
+# и channel.edit() не трогаем вообще. Можно переопределить/расширить через
+# CDN_REGION_CHANNEL_IDS в .env (JSON-объект region -> channel_id), не
+# трогая код, если список каналов на сервере изменится.
+_DEFAULT_CDN_REGION_CHANNEL_IDS = {
+    "brazil": 1551526056198930532,
+    "hongkong": 1551526578016616448,
+    "india": 1551526864160424006,
+    "japan": 1551527013817253938,
+    "rotterdam": 1551528004604403792,
+    "singapore": 1551528395253358673,
+    "southafrica": 1551528564099383296,
+    "sydney": 1551528807427735603,
+    "us-central": 1551529115071549550,
+    "us-east": 1551529310697951292,
+    "us-south": 1551529494412664903,
+    "us-west": 1551529899691483226,
+}
+try:
+    CDN_REGION_CHANNEL_IDS = {
+        k: int(v) for k, v in json.loads(os.environ.get("CDN_REGION_CHANNEL_IDS", "")).items()
+    } if os.environ.get("CDN_REGION_CHANNEL_IDS") else dict(_DEFAULT_CDN_REGION_CHANNEL_IDS)
+except Exception:
+    log.warning("CDN_REGION_CHANNEL_IDS в .env не распарсился -- беру дефолтную карту каналов")
+    CDN_REGION_CHANNEL_IDS = dict(_DEFAULT_CDN_REGION_CHANNEL_IDS)
+
+
 async def handle_probe(request: web.Request) -> web.Response:
     """POST /probe {"lua_desync_lines": ["--lua-desync=..."]} -- для
     Zenith orchestrator/voice_tester.py. Тот же путь, что и слэш-команды
@@ -424,7 +471,16 @@ async def handle_probe(request: web.Request) -> web.Response:
     /voice_test, просто без Discord-взаимодействия: сам достаёт lua-строки
     ИМЕННО ЭТОЙ стратегии из живого /opt/zapret2/config через
     extract_strategy_lines(), тем же путём, что /voice_test. lua_desync_lines
-    и strategy_n взаимоисключающие -- ровно один из двух должен быть задан."""
+    и strategy_n взаимоисключающие -- ровно один из двух должен быть задан.
+
+    Опционально принимает {"region": "us-east"} (см. VALID_RTC_REGIONS,
+    "auto"/null/отсутствие поля -- без изменений, как раньше) -- перед
+    подключением переключает rtc_region тестового канала, чтобы проверить
+    конкретный голосовой регион Discord, а не только тот, что Discord
+    выбрал бы автоматически. Нужно для выявления блокировок, завязанных
+    на конкретный регион/CDN voice-серверов (живой случай 2026-10-08:
+    ручное тестирование показало, что войс работает не на всех каналах --
+    гипотеза была именно в разнице регионов)."""
     try:
         body = await request.json()
     except Exception:
@@ -432,6 +488,14 @@ async def handle_probe(request: web.Request) -> web.Response:
 
     lua_lines = body.get("lua_desync_lines")
     strategy_n = body.get("strategy_n")
+    region = body.get("region")
+    if region in (None, "", "auto"):
+        region = None
+    elif region not in VALID_RTC_REGIONS:
+        return web.json_response({
+            "success": False, "connect_ms": 0,
+            "note": f"неизвестный region={region!r}, ожидался один из {sorted(VALID_RTC_REGIONS)} или \"auto\"",
+        }, status=400)
 
     if strategy_n is not None:
         if lua_lines:
@@ -455,9 +519,32 @@ async def handle_probe(request: web.Request) -> web.Response:
     guild = bot.get_guild(GUILD_ID)
     if guild is None:
         return web.json_response({"success": False, "connect_ms": 0, "note": "guild not cached yet, бот ещё стартует"})
-    channel = guild.get_channel(TEST_VOICE_CHANNEL_ID)
+
+    # Если для запрошенного региона есть готовый "CDN <регион>" канал --
+    # идём сразу в него (без channel.edit, см. докстринг
+    # CDN_REGION_CHANNEL_IDS). Иначе -- старое поведение: фиксированный
+    # TEST_VOICE_CHANNEL_ID, и, если region всё же задан, пробуем
+    # переключить его rtc_region на лету (нужен Manage Channels).
+    target_channel_id = TEST_VOICE_CHANNEL_ID
+    need_rtc_edit = False
+    if region is not None:
+        if region in CDN_REGION_CHANNEL_IDS:
+            target_channel_id = CDN_REGION_CHANNEL_IDS[region]
+        else:
+            need_rtc_edit = True
+
+    channel = guild.get_channel(target_channel_id)
     if channel is None:
-        return web.json_response({"success": False, "connect_ms": 0, "note": f"канал {TEST_VOICE_CHANNEL_ID} не найден"})
+        return web.json_response({"success": False, "connect_ms": 0, "note": f"канал {target_channel_id} не найден"})
+
+    if need_rtc_edit and channel.rtc_region != region:
+        try:
+            await channel.edit(rtc_region=region, reason="Zenith voice region probe")
+            # Пауза на распространение смены региона -- без неё
+            # ближайший connect() иногда ещё улетает в старый voice-сервер.
+            await asyncio.sleep(2)
+        except Exception as e:
+            return web.json_response({"success": False, "connect_ms": 0, "note": f"не удалось выставить rtc_region={region}: {e}"})
 
     hold_ok, hold_note, connect_time = await test_voice_connection(guild, channel)
     connect_failed = hold_note.startswith("connect() не удался")
@@ -465,6 +552,7 @@ async def handle_probe(request: web.Request) -> web.Response:
         "success": hold_ok and not connect_failed,
         "connect_ms": int(connect_time * 1000),
         "note": hold_note,
+        "region": region or "auto",
     })
 
 
