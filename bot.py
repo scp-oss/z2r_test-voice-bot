@@ -323,9 +323,38 @@ class VoiceTestResult:
         return self.apply_ok and self.connect_ok and self.hold_ok
 
 
+async def _ensure_voice_client_cleared(guild: discord.Guild, timeout: float = 10.0) -> None:
+    """Ждёт, пока discord.py реально уберёт guild.voice_client из своего
+    внутреннего реестра, вместо того чтобы доверять `await disconnect()`
+    на слово. Живой баг, найден 2026-10-13 на MTS/Penza при первом же
+    реальном запуске auto_voice_check (и /voice_rank тем же путём) --
+    disconnect(force=True) не гарантирует, что guild.voice_client уже
+    None к моменту, когда корутина возвращает управление: при коротком
+    зазоре между попытками (STRATEGY_SWITCH_DELAY=5s по умолчанию)
+    СЛЕДУЮЩИЙ channel.connect() иногда успевает попасть на ещё не до
+    конца убранный клиент и падает с discord.py ClientException("Already
+    connected to a voice channel."), connect_ms=0, пустой note -- КАЖДЫЙ
+    раз подряд внутри одного прохода (одиночные ручные /probe с большими
+    паузами между вызовами эту гонку почти никогда не ловили, поэтому
+    баг жил незамеченным, пока не появился именно rapid-fire sweep)."""
+    start = time.time()
+    while guild.voice_client is not None and time.time() - start < timeout:
+        await asyncio.sleep(0.25)
+
+
 async def test_voice_connection(guild: discord.Guild, channel: discord.VoiceChannel) -> tuple[bool, str, float]:
     """Подключается к голосовому каналу, держит соединение HOLD_SECONDS и
     проверяет что оно не отвалилось. Возвращает (ok, note, connect_time_s)."""
+    # Самоисцеление: если с ПРЕДЫДУЩЕГО вызова остался недочищенный
+    # voice_client (та же гонка, что ниже) -- форсируем его разрыв
+    # сейчас, а не падаем сразу с "Already connected".
+    if guild.voice_client is not None:
+        try:
+            await guild.voice_client.disconnect(force=True)
+        except Exception:
+            pass
+        await _ensure_voice_client_cleared(guild)
+
     t0 = time.time()
     try:
         vc = await channel.connect(timeout=CONNECT_TIMEOUT, reconnect=False)
@@ -349,6 +378,9 @@ async def test_voice_connection(guild: discord.Guild, channel: discord.VoiceChan
             await vc.disconnect(force=True)
         except Exception:
             pass
+        # См. докстринг _ensure_voice_client_cleared -- ждём РЕАЛЬНОГО
+        # снятия регистрации, не просто возврата из disconnect().
+        await _ensure_voice_client_cleared(guild)
 
     return hold_ok, hold_note, connect_time
 
