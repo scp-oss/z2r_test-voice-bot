@@ -1,3 +1,10 @@
 discord.py>=2.4.0
 python-dotenv>=1.0.1
 PyYAML>=6.0.1
+# Both undeclared until 2026-10-13 (only present on NETH-4 because someone
+# installed them by hand at some point) -- without PyNaCl, discord.py's
+# VoiceClient.connect() silently can't do voice at all ("PyNaCl is not
+# installed, voice will NOT be supported"), which is this whole bot's one
+# job. Found deploying fresh to a second server (MTS/Penza).
+PyNaCl>=1.5.0
+davey>=0.1.6
