@@ -678,6 +678,12 @@ class ZapretBot(commands.Bot):
             # applications.commands, нужен новый инвайт с обоими scope.
             log.error("Не удалось синхронизировать slash-команды (не критично для Zenith): %s", e)
         await start_probe_server()
+        if PROFILE_EVENTS_ENABLED:
+            profile_events_watch.start()
+            log.info("События профилей: слежу за %s и %s", AUTOTUNE_STATE_DIR, PROMOTER_EVENTS_FILE)
+        if PROFILE_REPORT_INTERVAL_HOURS > 0:
+            profiles_report.start()
+            log.info("Сводка по профилям: раз в %gч", PROFILE_REPORT_INTERVAL_HOURS)
         if AUTO_CHECK_INTERVAL_HOURS > 0:
             auto_voice_check.start()
             log.info(
@@ -998,6 +1004,200 @@ async def stream_check(interaction: discord.Interaction):
     await interaction.response.send_message(f"Смотрю стрим {m.display_name} в «{ch.name}» ~{STREAM_WATCH_SECONDS}с, результат пришлю в ЛС.", ephemeral=True)
     res = await run_stream_watch(ch, m)
     await notify(stream_embed(res, ch, m), interaction.user)
+
+
+# --- Отчёты по остальным профилям (2026-11-13) ---
+# Как для VOICE_UDP (auto_voice_check), только источник -- то, что уже
+# делают autotune-демоны (status_profile_N.txt, daemon_profile_N.log) и
+# Zenith promoter (promoter_events.log). Мгновенно -- только значимые
+# события, остальное -- в сводку раз в PROFILE_REPORT_INTERVAL_HOURS.
+import re as _re
+import datetime as _dt
+
+AUTOTUNE_STATE_DIR = os.environ.get("AUTOTUNE_STATE_DIR", "/opt/z2r_autobench/autotune_state")
+PROMOTER_EVENTS_FILE = os.environ.get("PROMOTER_EVENTS_FILE", "/opt/z2r_autobench/Zenith/orchestrator/promoter_events.log")
+PROFILE_REPORT_INTERVAL_HOURS = float(os.environ.get("PROFILE_REPORT_INTERVAL_HOURS", "6"))
+PROFILE_EVENTS_ENABLED = os.environ.get("PROFILE_EVENTS", "1") == "1"
+PROFILE_EVENT_THROTTLE = int(os.environ.get("PROFILE_EVENT_THROTTLE_SECONDS", str(6 * 3600)))
+PROFILE_NAMES = {1: "YT_TLS", 2: "GV_TLS", 3: "RKN_TLS", 4: "DS_TLS", 5: "YT_QUIC_UDP", 6: "VOICE_UDP"}
+
+_RE_TS = _re.compile(r"^\[(\d{4}-\d\d-\d\dT[\d:]+[+-]\d\d:\d\d)\]\s*(.*)$")
+_RE_PROBLEM = _re.compile(r"PROBLEM: profile=(\d+) \((\w+)\) провал health-check \((\d+)/(\d+)\)")
+_RE_OK = _re.compile(r"OK: profile=(\d+) \((\w+)\) снова работает")
+_RE_APPLIED = _re.compile(r"RETUNE: применена новая стратегия .*?profile=?(\d+)?|RETUNE: применена новая стратегия")
+_RE_PID = _re.compile(r"profile=(\d+)")
+_log_offsets: dict[str, int] = {}
+_profile_broken: set[int] = set()
+_event_last: dict[tuple, float] = {}
+
+
+def _read_new_lines(path: str) -> list[str]:
+    """Новые строки с прошлого вызова. На первом вызове -- с конца файла
+    (после рестарта бота не засыпаем ЛС старой историей)."""
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return []
+    off = _log_offsets.get(path)
+    if off is None or off > size:
+        _log_offsets[path] = size
+        return []
+    if off == size:
+        return []
+    try:
+        with open(path, "r", errors="replace") as f:
+            f.seek(off)
+            data = f.read()
+            _log_offsets[path] = f.tell()
+    except OSError:
+        return []
+    return [l for l in data.splitlines() if l.strip()]
+
+
+def _throttled(key: tuple) -> bool:
+    now = time.monotonic()
+    if now - _event_last.get(key, -1e12) < PROFILE_EVENT_THROTTLE:
+        return True
+    _event_last[key] = now
+    return False
+
+
+def _classify_autotune_line(line: str):
+    """-> (emoji, title, color) или None, если строка не стоит отдельного ЛС."""
+    m = _RE_PROBLEM.search(line)
+    if m:
+        pid, name, n, of = int(m[1]), m[2], int(m[3]), int(m[4])
+        if n >= of and pid not in _profile_broken:
+            _profile_broken.add(pid)
+            return ("🔴", f"{name}: профиль перестал работать ({n}/{of} провалов подряд) -- autotune начинает переподбор", discord.Color.red())
+        return None
+    m = _RE_OK.search(line)
+    if m:
+        pid, name = int(m[1]), m[2]
+        if pid in _profile_broken:
+            _profile_broken.discard(pid)
+            return ("🟢", f"{name}: профиль снова работает", discord.Color.green())
+        return None
+    pm = _RE_PID.search(line)
+    pid = int(pm[1]) if pm else 0
+    if "применена новая стратегия" in line:
+        return ("✅", "Autotune применил новую стратегию", discord.Color.green())
+    if "не нашлось НИ ОДНОЙ рабочей стратегии" in line and not _throttled((pid, "none")):
+        return ("⚠️", "Autotune: полный перебор не нашёл рабочей стратегии", discord.Color.orange())
+    if "но живая проверка" in line and not _throttled((pid, "live")):
+        return ("↩️", "Autotune: стратегия прошла перебор, но не прошла живую проверку -- откат", discord.Color.orange())
+    return None
+
+
+@tasks.loop(seconds=60)
+async def profile_events_watch():
+    import glob
+    for path in sorted(glob.glob(os.path.join(AUTOTUNE_STATE_DIR, "daemon_profile_*.log"))):
+        for line in _read_new_lines(path):
+            ev = _classify_autotune_line(line)
+            if not ev:
+                continue
+            emoji, title, color = ev
+            m = _RE_TS.match(line)
+            e = discord.Embed(title=f"{emoji} {title}", color=color,
+                              description=(m[2] if m else line)[:1500])
+            if m:
+                e.set_footer(text=m[1])
+            await notify(e, None)
+    for line in _read_new_lines(PROMOTER_EVENTS_FILE):
+        ok = "продвинут как" in line
+        e = discord.Embed(title=("🚀 Zenith продвинул новую стратегию" if ok else "↩️ Zenith: откат продвижения"),
+                          color=discord.Color.blue() if ok else discord.Color.orange(), description=line[:1500])
+        await notify(e, None)
+
+
+@profile_events_watch.before_loop
+async def _before_profile_events_watch():
+    await bot.wait_until_ready()
+
+
+def _profile_status_lines() -> list[str]:
+    out = []
+    since = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(hours=24)
+    for pid, name in PROFILE_NAMES.items():
+        st = ""
+        try:
+            with open(os.path.join(AUTOTUNE_STATE_DIR, f"status_profile_{pid}.txt")) as f:
+                body = f.read()
+            m = _re.search(r"текущая стратегия=(\d+), провалов подряд=(\d+)/(\d+)", body)
+            if m:
+                st = f"strategy={m[1]}, провалов подряд {m[2]}/{m[3]}"
+        except OSError:
+            st = "нет данных autotune"
+        prob = rec = applied = none = 0
+        try:
+            with open(os.path.join(AUTOTUNE_STATE_DIR, f"daemon_profile_{pid}.log"), errors="replace") as f:
+                f.seek(max(0, os.path.getsize(f.name) - 400_000))
+                for line in f:
+                    m = _RE_TS.match(line.strip())
+                    if not m:
+                        continue
+                    try:
+                        if _dt.datetime.fromisoformat(m[1]) < since:
+                            continue
+                    except ValueError:
+                        continue
+                    t = m[2]
+                    prob += "PROBLEM:" in t
+                    rec += "снова работает" in t
+                    applied += "применена новая стратегия" in t
+                    none += "НИ ОДНОЙ рабочей" in t
+        except OSError:
+            pass
+        icon = "🔴" if pid in _profile_broken else ("🟡" if prob else "🟢")
+        extra = f" · 24ч: провалов проверки {prob}, восстановлений {rec}" + (f", новых стратегий {applied}" if applied else "") + (f", переборов без результата {none}" if none else "")
+        out.append(f"{icon} **{name}** — {st}{extra}")
+    return out
+
+
+def _gv_ramp_line() -> str:
+    try:
+        with open(ZAPRET_CONFIG_PATH) as f:
+            kv = dict(l.strip().split("=", 1) for l in f if l.startswith("Z2R_WSSIZE_RAMP_") and "=" in l and not l.startswith(" "))
+    except OSError:
+        return ""
+    if not kv:
+        return ""
+    if kv.get("Z2R_WSSIZE_RAMP_ENABLE") != "1":
+        return "GV wssize_ramp: выключен"
+    return (f"GV wssize_ramp: {kv.get('Z2R_WSSIZE_RAMP_MODE')}, wsize={kv.get('Z2R_WSSIZE_RAMP_WSIZE')}, "
+            f"scale={kv.get('Z2R_WSSIZE_RAMP_SCALE')}, open={kv.get('Z2R_WSSIZE_RAMP_OPEN')}")
+
+
+def build_profiles_report(title: str) -> discord.Embed:
+    e = discord.Embed(title=title, color=discord.Color.blurple(), description="\n".join(_profile_status_lines()))
+    ramp = _gv_ramp_line()
+    if ramp:
+        e.add_field(name="Googlevideo", value=ramp, inline=False)
+    try:
+        with open(PROMOTER_EVENTS_FILE, errors="replace") as f:
+            last = [l.strip() for l in f if l.strip()][-1:]
+        if last:
+            e.add_field(name="Последнее действие Zenith promoter", value=last[0][:1000], inline=False)
+    except OSError:
+        pass
+    return e
+
+
+@tasks.loop(hours=max(PROFILE_REPORT_INTERVAL_HOURS, 0.1))
+async def profiles_report():
+    await notify(build_profiles_report(f"📊 Профили z2r — сводка (раз в {PROFILE_REPORT_INTERVAL_HOURS:g}ч)"), None)
+
+
+@profiles_report.before_loop
+async def _before_profiles_report():
+    await bot.wait_until_ready()
+    await asyncio.sleep(120)  # не сразу при старте -- даём демонам обновить status
+
+
+@bot.tree.command(name="profiles_status", description="Сводка по всем профилям z2r (autotune + Zenith) прямо сейчас")
+async def profiles_status(interaction: discord.Interaction):
+    await interaction.response.send_message(embed=build_profiles_report("📊 Профили z2r — сейчас"), ephemeral=True)
 
 
 @bot.event
