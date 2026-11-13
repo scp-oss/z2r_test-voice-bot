@@ -926,6 +926,80 @@ async def voice_leave(interaction: discord.Interaction):
     await interaction.response.send_message("Бот вышел из войса.")
 
 
+# --- Наблюдение за демонстрацией экрана (Go Live) ---
+# Бот сам смотреть стрим не может (STREAM_WATCH для бот-токена -> close 4001),
+# поэтому он только видит self_stream и зовёт stream_watch/watcher.py
+# (реальный Chrome с тестовым аккаунтом), а вердикт шлёт в ЛС.
+STREAM_WATCH_URL = os.environ.get("STREAM_WATCH_URL", "http://127.0.0.1:8770/watch")
+STREAM_AUTO_WATCH = os.environ.get("STREAM_AUTO_WATCH", "1") == "1"
+STREAM_WATCH_SECONDS = int(os.environ.get("STREAM_WATCH_SECONDS", "60"))
+STREAM_WATCH_COOLDOWN = int(os.environ.get("STREAM_WATCH_COOLDOWN", "600"))
+_stream_last_check: dict[int, float] = {}
+
+_STREAM_VERDICT_TEXT = {
+    "OK": ("✅ Стрим показывается", discord.Color.green()),
+    "LOADING": ("⏳ Стрим вечно грузится (кадры не идут)", discord.Color.orange()),
+    "GRAY": ("🌫️ Серый экран (кадры однотонные)", discord.Color.orange()),
+    "FROZEN": ("🧊 Картинка застыла (<1 кадр/с)", discord.Color.orange()),
+    "NO_STREAM": ("❔ Стрим не найден в браузере", discord.Color.light_grey()),
+    "BUSY": ("⌛ Наблюдатель уже занят другим просмотром", discord.Color.light_grey()),
+    "ERROR": ("❌ Ошибка наблюдателя", discord.Color.red()),
+}
+
+
+async def run_stream_watch(channel: discord.VoiceChannel, member: discord.Member) -> dict:
+    import aiohttp
+    payload = {"channel_id": str(channel.id), "user_id": str(member.id), "seconds": STREAM_WATCH_SECONDS}
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.post(STREAM_WATCH_URL, json=payload, timeout=aiohttp.ClientTimeout(total=STREAM_WATCH_SECONDS + 90)) as r:
+                return await r.json(content_type=None)
+    except Exception as e:
+        return {"verdict": "ERROR", "note": f"watcher недоступен: {e}"}
+
+
+def stream_embed(res: dict, channel: discord.VoiceChannel, member: discord.Member) -> discord.Embed:
+    title, color = _STREAM_VERDICT_TEXT.get(res.get("verdict"), (res.get("verdict", "?"), discord.Color.light_grey()))
+    e = discord.Embed(title=title, color=color, description=f"{member.display_name} в «{channel.name}»")
+    for k, label in (("resolution", "Разрешение"), ("fps", "Кадров/с"), ("dropped", "Потеряно кадров"),
+                     ("picture_changes", "Смен картинки"), ("seconds", "Смотрел, с")):
+        if k in res:
+            e.add_field(name=label, value=str(res[k]))
+    if res.get("note"):
+        e.add_field(name="Примечание", value=str(res["note"])[:1000], inline=False)
+    return e
+
+
+@bot.event
+async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
+    if not STREAM_AUTO_WATCH or member.bot or member.guild.id != GUILD_ID:
+        return
+    if not after.self_stream or before.self_stream or after.channel is None:
+        return
+    now = time.monotonic()
+    if now - _stream_last_check.get(member.id, -1e9) < STREAM_WATCH_COOLDOWN:
+        return
+    _stream_last_check[member.id] = now
+    log.info("Go Live: %s в %s -- запускаю наблюдатель", member, after.channel)
+    await asyncio.sleep(8)  # даём стриму подняться
+    res = await run_stream_watch(after.channel, member)
+    log.info("Go Live вердикт: %s", res.get("verdict"))
+    await notify(stream_embed(res, after.channel, member), None)
+
+
+@bot.tree.command(description="Проверить демонстрацию экрана, идущую сейчас в голосовых каналах")
+async def stream_check(interaction: discord.Interaction):
+    guild = interaction.guild or bot.get_guild(GUILD_ID)
+    live = [(ch, m) for ch in guild.voice_channels for m in ch.members if m.voice and m.voice.self_stream]
+    if not live:
+        await interaction.response.send_message("Сейчас никто не стримит.", ephemeral=True)
+        return
+    ch, m = live[0]
+    await interaction.response.send_message(f"Смотрю стрим {m.display_name} в «{ch.name}» ~{STREAM_WATCH_SECONDS}с, результат пришлю в ЛС.", ephemeral=True)
+    res = await run_stream_watch(ch, m)
+    await notify(stream_embed(res, ch, m), interaction.user)
+
+
 @bot.event
 async def on_ready():
     log.info("Бот запущен как %s (id=%s)", bot.user, bot.user.id)

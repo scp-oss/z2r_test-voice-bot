@@ -1,0 +1,14 @@
+[Unit]
+Description=Discord Go Live watcher (real browser, test account) for z2r_test-voice-bot
+After=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/opt/z2r_autobench/z2r_test-voice-bot/.env
+Environment=DISPLAY=:99
+ExecStart=/root/pwvenv/bin/python /opt/z2r_autobench/z2r_test-voice-bot/stream_watch/watcher.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
