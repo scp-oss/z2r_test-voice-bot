@@ -385,7 +385,37 @@ async def test_voice_connection(guild: discord.Guild, channel: discord.VoiceChan
     return hold_ok, hold_note, connect_time
 
 
+# Общий с Zenith лок песочницы (см. Zenith/orchestrator/sandbox_apply.py):
+# голосовая проба (применить стратегию -> зайти -> подержать) целиком под ним,
+# иначе TCP-раунд Zenith и голосовая проба переписывают конфиг друг другу.
+SANDBOX_LOCK_FILE = os.path.join(ZENITH_SANDBOX_DIR, ".sandbox.lock")
+
+
+class _SandboxLock:
+    async def __aenter__(self):
+        import fcntl
+        self.fd = None
+        try:
+            self.fd = os.open(SANDBOX_LOCK_FILE, os.O_RDONLY)
+        except OSError as e:
+            log.warning("лок песочницы %s недоступен (%s) -- работаю без него", SANDBOX_LOCK_FILE, e)
+            return self
+        await asyncio.get_running_loop().run_in_executor(None, fcntl.flock, self.fd, fcntl.LOCK_EX)
+        return self
+
+    async def __aexit__(self, *exc):
+        import fcntl
+        if self.fd is not None:
+            fcntl.flock(self.fd, fcntl.LOCK_UN)
+            os.close(self.fd)
+
+
 async def run_voice_test(strategy_name: str) -> VoiceTestResult:
+    async with _SandboxLock():
+        return await _run_voice_test_unlocked(strategy_name)
+
+
+async def _run_voice_test_unlocked(strategy_name: str) -> VoiceTestResult:
     strat = state.strategies[strategy_name]
 
     lua_lines = extract_strategy_lines(ZAPRET_CONFIG_PATH, VOICE_PROFILE, strat.strategy_n)
@@ -516,6 +546,11 @@ except Exception:
 
 
 async def handle_probe(request: web.Request) -> web.Response:
+    async with _SandboxLock():
+        return await _handle_probe_unlocked(request)
+
+
+async def _handle_probe_unlocked(request: web.Request) -> web.Response:
     """POST /probe {"lua_desync_lines": ["--lua-desync=..."]} -- для
     Zenith orchestrator/voice_tester.py. Тот же путь, что и слэш-команды
     (apply_to_sandbox + test_voice_connection), только геном приходит
@@ -678,6 +713,12 @@ class ZapretBot(commands.Bot):
             # applications.commands, нужен новый инвайт с обоими scope.
             log.error("Не удалось синхронизировать slash-команды (не критично для Zenith): %s", e)
         await start_probe_server()
+        if PROFILE_EVENTS_ENABLED:
+            profile_events_watch.start()
+            log.info("События профилей: слежу за %s и %s", AUTOTUNE_STATE_DIR, PROMOTER_EVENTS_FILE)
+        if PROFILE_REPORT_INTERVAL_HOURS > 0:
+            profiles_report.start()
+            log.info("Сводка по профилям: раз в %gч", PROFILE_REPORT_INTERVAL_HOURS)
         if AUTO_CHECK_INTERVAL_HOURS > 0:
             auto_voice_check.start()
             log.info(
@@ -924,6 +965,382 @@ async def voice_leave(interaction: discord.Interaction):
         return
     await guild.voice_client.disconnect(force=True)
     await interaction.response.send_message("Бот вышел из войса.")
+
+
+# --- Наблюдение за демонстрацией экрана (Go Live) ---
+# Бот сам смотреть стрим не может (STREAM_WATCH для бот-токена -> close 4001),
+# поэтому он только видит self_stream и зовёт stream_watch/watcher.py
+# (реальный Chrome с тестовым аккаунтом), а вердикт шлёт в ЛС.
+STREAM_WATCH_URL = os.environ.get("STREAM_WATCH_URL", "http://127.0.0.1:8770/watch")
+STREAM_AUTO_WATCH = os.environ.get("STREAM_AUTO_WATCH", "1") == "1"
+STREAM_WATCH_SECONDS = int(os.environ.get("STREAM_WATCH_SECONDS", "60"))
+STREAM_WATCH_COOLDOWN = int(os.environ.get("STREAM_WATCH_COOLDOWN", "600"))
+_stream_last_check: dict[int, float] = {}
+
+_STREAM_VERDICT_TEXT = {
+    "OK": ("✅ Стрим показывается", discord.Color.green()),
+    "LOADING": ("⏳ Стрим вечно грузится (кадры не идут)", discord.Color.orange()),
+    "GRAY": ("🌫️ Серый экран (кадры однотонные)", discord.Color.orange()),
+    "FROZEN": ("🧊 Картинка застыла (<1 кадр/с)", discord.Color.orange()),
+    "NO_STREAM": ("❔ Стрим не найден в браузере", discord.Color.light_grey()),
+    "BUSY": ("⌛ Наблюдатель уже занят другим просмотром", discord.Color.light_grey()),
+    "ERROR": ("❌ Ошибка наблюдателя", discord.Color.red()),
+}
+
+
+async def run_stream_watch(channel: discord.VoiceChannel, member: discord.Member) -> dict:
+    import aiohttp
+    payload = {"channel_id": str(channel.id), "user_id": str(member.id), "seconds": STREAM_WATCH_SECONDS}
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.post(STREAM_WATCH_URL, json=payload, timeout=aiohttp.ClientTimeout(total=STREAM_WATCH_SECONDS + 90)) as r:
+                return await r.json(content_type=None)
+    except Exception as e:
+        return {"verdict": "ERROR", "note": f"watcher недоступен: {e}"}
+
+
+def stream_embed(res: dict, channel: discord.VoiceChannel, member: discord.Member) -> discord.Embed:
+    title, color = _STREAM_VERDICT_TEXT.get(res.get("verdict"), (res.get("verdict", "?"), discord.Color.light_grey()))
+    e = discord.Embed(title=title, color=color, description=f"{member.display_name} в «{channel.name}»")
+    for k, label in (("resolution", "Разрешение"), ("fps", "Кадров/с"), ("dropped", "Потеряно кадров"),
+                     ("picture_changes", "Смен картинки"), ("seconds", "Смотрел, с")):
+        if k in res:
+            e.add_field(name=label, value=str(res[k]))
+    if res.get("note"):
+        e.add_field(name="Примечание", value=str(res["note"])[:1000], inline=False)
+    return e
+
+
+@bot.event
+async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
+    if not STREAM_AUTO_WATCH or member.bot or member.guild.id != GUILD_ID:
+        return
+    if not after.self_stream or before.self_stream or after.channel is None:
+        return
+    now = time.monotonic()
+    if now - _stream_last_check.get(member.id, -1e9) < STREAM_WATCH_COOLDOWN:
+        return
+    _stream_last_check[member.id] = now
+    log.info("Go Live: %s в %s -- запускаю наблюдатель", member, after.channel)
+    await asyncio.sleep(8)  # даём стриму подняться
+    res = await run_stream_watch(after.channel, member)
+    log.info("Go Live вердикт: %s", res.get("verdict"))
+    await notify(stream_embed(res, after.channel, member), None)
+
+
+@bot.tree.command(description="Проверить демонстрацию экрана, идущую сейчас в голосовых каналах")
+async def stream_check(interaction: discord.Interaction):
+    guild = interaction.guild or bot.get_guild(GUILD_ID)
+    live = [(ch, m) for ch in guild.voice_channels for m in ch.members if m.voice and m.voice.self_stream]
+    if not live:
+        await interaction.response.send_message("Сейчас никто не стримит.", ephemeral=True)
+        return
+    ch, m = live[0]
+    await interaction.response.send_message(f"Смотрю стрим {m.display_name} в «{ch.name}» ~{STREAM_WATCH_SECONDS}с, результат пришлю в ЛС.", ephemeral=True)
+    res = await run_stream_watch(ch, m)
+    await notify(stream_embed(res, ch, m), interaction.user)
+
+
+# --- Отчёты по остальным профилям (2026-11-13) ---
+# Как для VOICE_UDP (auto_voice_check), только источник -- то, что уже
+# делают autotune-демоны (status_profile_N.txt, daemon_profile_N.log) и
+# Zenith promoter (promoter_events.log). Мгновенно -- только значимые
+# события, остальное -- в сводку раз в PROFILE_REPORT_INTERVAL_HOURS.
+import re as _re
+import datetime as _dt
+
+AUTOTUNE_STATE_DIR = os.environ.get("AUTOTUNE_STATE_DIR", "/opt/z2r_autobench/autotune_state")
+PROMOTER_EVENTS_FILE = os.environ.get("PROMOTER_EVENTS_FILE", "/opt/z2r_autobench/Zenith/orchestrator/promoter_events.log")
+PROFILE_REPORT_INTERVAL_HOURS = float(os.environ.get("PROFILE_REPORT_INTERVAL_HOURS", "6"))
+PROFILE_EVENTS_ENABLED = os.environ.get("PROFILE_EVENTS", "1") == "1"
+PROFILE_EVENT_THROTTLE = int(os.environ.get("PROFILE_EVENT_THROTTLE_SECONDS", str(6 * 3600)))
+# Подпись сервера в отчётах -- когда нод несколько (Дом.ру, МТС...), иначе
+# не понять, чья сводка. NODE_LABEL в .env бота, по умолчанию hostname.
+import socket as _socket
+NODE_LABEL = os.environ.get("NODE_LABEL") or _socket.gethostname()
+PROFILE_NAMES = {1: "YT_TLS", 2: "GV_TLS", 3: "RKN_TLS", 4: "DS_TLS", 5: "YT_QUIC_UDP", 6: "VOICE_UDP"}
+
+_RE_TS = _re.compile(r"^\[(\d{4}-\d\d-\d\dT[\d:]+[+-]\d\d:\d\d)\]\s*(.*)$")
+_RE_PROBLEM = _re.compile(r"PROBLEM: profile=(\d+) \((\w+)\) провал health-check \((\d+)/(\d+)\)")
+_RE_OK = _re.compile(r"OK: profile=(\d+) \((\w+)\) снова работает")
+_RE_APPLIED = _re.compile(r"RETUNE: применена новая стратегия .*?profile=?(\d+)?|RETUNE: применена новая стратегия")
+_RE_PID = _re.compile(r"profile=(\d+)")
+_log_offsets: dict[str, int] = {}
+_profile_broken: set[int] = set()
+_event_last: dict[tuple, float] = {}
+
+
+def _read_new_lines(path: str) -> list[str]:
+    """Новые строки с прошлого вызова. На первом вызове -- с конца файла
+    (после рестарта бота не засыпаем ЛС старой историей)."""
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return []
+    off = _log_offsets.get(path)
+    if off is None or off > size:
+        _log_offsets[path] = size
+        return []
+    if off == size:
+        return []
+    try:
+        with open(path, "r", errors="replace") as f:
+            f.seek(off)
+            data = f.read()
+            _log_offsets[path] = f.tell()
+    except OSError:
+        return []
+    return [l for l in data.splitlines() if l.strip()]
+
+
+def _throttled(key: tuple) -> bool:
+    now = time.monotonic()
+    if now - _event_last.get(key, -1e12) < PROFILE_EVENT_THROTTLE:
+        return True
+    _event_last[key] = now
+    return False
+
+
+def _classify_autotune_line(line: str):
+    """-> (emoji, title, color) или None, если строка не стоит отдельного ЛС."""
+    m = _RE_PROBLEM.search(line)
+    if m:
+        pid, name, n, of = int(m[1]), m[2], int(m[3]), int(m[4])
+        if n >= of and pid not in _profile_broken:
+            _profile_broken.add(pid)
+            return ("🔴", f"{name}: профиль перестал работать ({n}/{of} провалов подряд) -- autotune начинает переподбор", discord.Color.red())
+        return None
+    m = _RE_OK.search(line)
+    if m:
+        pid, name = int(m[1]), m[2]
+        if pid in _profile_broken:
+            _profile_broken.discard(pid)
+            return ("🟢", f"{name}: профиль снова работает", discord.Color.green())
+        return None
+    pm = _RE_PID.search(line)
+    pid = int(pm[1]) if pm else 0
+    if "применена новая стратегия" in line:
+        return ("✅", "Autotune применил новую стратегию", discord.Color.green())
+    if "не нашлось НИ ОДНОЙ рабочей стратегии" in line and not _throttled((pid, "none")):
+        return ("⚠️", "Autotune: полный перебор не нашёл рабочей стратегии", discord.Color.orange())
+    if "но живая проверка" in line and not _throttled((pid, "live")):
+        return ("↩️", "Autotune: стратегия прошла перебор, но не прошла живую проверку -- откат", discord.Color.orange())
+    return None
+
+
+WATCH_SERVICES = [x for x in os.environ.get("WATCH_SERVICES", "zapret2,zenith-autorun,zenith-promoter,zenith-panel,ws-transparent-relay,autotune-profile@1,autotune-profile@2,autotune-profile@3,autotune-profile@4,autotune-profile@5,autotune-profile@6").split(",") if x]
+_service_down: dict[str, int] = {}
+
+
+async def _check_services():
+    """Ключевые юниты: уведомление, если юнит не active 2 проверки подряд
+    (~2 мин, чтобы не дёргаться на штатном рестарте), и когда вернулся."""
+    for unit in WATCH_SERVICES:
+        try:
+            proc = await asyncio.create_subprocess_exec("systemctl", "is-active", unit,
+                                                        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+            out, _ = await asyncio.wait_for(proc.communicate(), 10)
+            st = out.decode().strip()
+        except Exception:
+            continue
+        if st == "active":
+            if _service_down.get(unit, 0) >= 2:
+                await notify(discord.Embed(title=f"🟢 [{NODE_LABEL}] {unit} снова работает", color=discord.Color.green()), None)
+            _service_down.pop(unit, None)
+        elif st in ("inactive", "failed", "activating", "deactivating"):
+            _service_down[unit] = _service_down.get(unit, 0) + 1
+            if _service_down[unit] == 2:
+                await notify(discord.Embed(title=f"🔴 [{NODE_LABEL}] {unit}: {st}",
+                                           description="Сервис не работает уже ~2 минуты. Проверь: journalctl -u " + unit,
+                                           color=discord.Color.red()), None)
+
+
+@tasks.loop(seconds=60)
+async def profile_events_watch():
+    await _check_services()
+    import glob
+    for path in sorted(glob.glob(os.path.join(AUTOTUNE_STATE_DIR, "daemon_profile_*.log"))):
+        for line in _read_new_lines(path):
+            ev = _classify_autotune_line(line)
+            if not ev:
+                continue
+            emoji, title, color = ev
+            m = _RE_TS.match(line)
+            e = discord.Embed(title=f"{emoji} [{NODE_LABEL}] {title}", color=color,
+                              description=(m[2] if m else line)[:1500])
+            if m:
+                e.set_footer(text=m[1])
+            await notify(e, None)
+    for line in _read_new_lines(PROMOTER_EVENTS_FILE):
+        ok = "продвинут как" in line
+        e = discord.Embed(title=(f"🚀 [{NODE_LABEL}] Zenith продвинул новую стратегию" if ok else f"↩️ [{NODE_LABEL}] Zenith: откат продвижения"),
+                          color=discord.Color.blue() if ok else discord.Color.orange(), description=line[:1500])
+        await notify(e, None)
+
+
+@profile_events_watch.before_loop
+async def _before_profile_events_watch():
+    await bot.wait_until_ready()
+
+
+def _profile_status_lines() -> list[str]:
+    out = []
+    since = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(hours=24)
+    for pid, name in PROFILE_NAMES.items():
+        st = ""
+        try:
+            with open(os.path.join(AUTOTUNE_STATE_DIR, f"status_profile_{pid}.txt")) as f:
+                body = f.read()
+            m = _re.search(r"текущая стратегия=(\d+), провалов подряд=(\d+)/(\d+)", body)
+            cur = None
+            if m:
+                cur = m[1]
+                st = f"strategy={m[1]}, провалов подряд {m[2]}/{m[3]}"
+        except OSError:
+            st = "нет данных autotune"
+        prob = rec = applied = none = 0
+        try:
+            with open(os.path.join(AUTOTUNE_STATE_DIR, f"daemon_profile_{pid}.log"), errors="replace") as f:
+                f.seek(max(0, os.path.getsize(f.name) - 400_000))
+                for line in f:
+                    m = _RE_TS.match(line.strip())
+                    if not m:
+                        continue
+                    try:
+                        if _dt.datetime.fromisoformat(m[1]) < since:
+                            continue
+                    except ValueError:
+                        continue
+                    t = m[2]
+                    prob += "PROBLEM:" in t
+                    rec += "снова работает" in t
+                    applied += "применена новая стратегия" in t
+                    none += "НИ ОДНОЙ рабочей" in t
+        except OSError:
+            pass
+        icon = "🔴" if pid in _profile_broken else ("🟡" if prob else "🟢")
+        extra = f" · 24ч: провалов проверки {prob}, восстановлений {rec}" + (f", новых стратегий {applied}" if applied else "") + (f", переборов без результата {none}" if none else "")
+        out.append(f"{icon} **{name}** — {st}{extra}")
+        out.append(_top3(pid, locals().get("cur")))
+    return out
+
+
+RANK_LOG_DIR = os.environ.get("RANK_LOG_DIR", "/opt/z2r_autobench/logs")
+_RANK_GLOB = {1: "rank_1_*.raw.tsv", 2: "rank_2_*.raw.tsv", 3: "rank_3_*.raw.tsv", 4: "rank_4_*.raw.tsv",
+              5: "rank_quic_*.raw.tsv", 6: "rank_6_*.raw.tsv"}
+
+
+def _top3(pid: int, current: str | None) -> str:
+    """Топ-3 стратегии профиля по последнему перебору autotune (rank_*.raw.tsv):
+    доля успехов, при равенстве -- больше байт (TCP/QUIC) или меньше мс
+    подключения (голос). Отмечает боевую (★) и возраст данных."""
+    import glob, csv
+    files = sorted(glob.glob(os.path.join(RANK_LOG_DIR, _RANK_GLOB[pid])), key=os.path.getmtime)
+    if not files:
+        return "   топ-3: перебора ещё не было"
+    path = files[-1]
+    agg: dict[str, list] = {}
+    try:
+        with open(path, newline="") as f:
+            rows = list(csv.DictReader(f, delimiter="\t"))
+    except OSError:
+        return "   топ-3: нет доступа к результатам перебора"
+    metric = "ms" if rows and "bytes" not in rows[0] else "bytes"
+    for r in rows:
+        try:
+            a = agg.setdefault(r["strategy"], [0, 0, 0.0])
+            a[0] += 1
+            ok = r["success"] == "1"
+            a[1] += ok
+            if ok:
+                a[2] += float(r.get(metric) or 0)
+        except (KeyError, ValueError):
+            continue
+    if not agg:
+        return "   топ-3: пустой результат перебора"
+    def key(item):
+        n, ok, m = item[1]
+        avg = m / ok if ok else 0
+        return (ok / n, avg if metric == "bytes" else -avg)
+    best = [it for it in sorted(agg.items(), key=key, reverse=True) if it[1][1] > 0][:3]
+    age_h = (time.time() - os.path.getmtime(path)) / 3600
+    if not best:
+        return f"   топ-3: в последнем переборе ({age_h:.0f}ч назад) ни одна стратегия не прошла"
+    parts = []
+    for strat, (n, ok, m) in best:
+        avg = m / ok
+        val = f"{avg / 1000:.0f}КБ" if metric == "bytes" else f"{avg:.0f}мс"
+        parts.append(f"{'★' if strat == current else ''}s{strat} {ok}/{n} · {val}")
+    return f"   топ-3 ({age_h:.0f}ч назад): " + ", ".join(parts)
+
+
+def _gv_ramp_line() -> str:
+    try:
+        with open(ZAPRET_CONFIG_PATH) as f:
+            kv = dict(l.strip().split("=", 1) for l in f if l.startswith("Z2R_WSSIZE_RAMP_") and "=" in l and not l.startswith(" "))
+    except OSError:
+        return ""
+    if not kv:
+        return ""
+    if kv.get("Z2R_WSSIZE_RAMP_ENABLE") != "1":
+        return "GV wssize_ramp: выключен"
+    return (f"GV wssize_ramp: {kv.get('Z2R_WSSIZE_RAMP_MODE')}, wsize={kv.get('Z2R_WSSIZE_RAMP_WSIZE')}, "
+            f"scale={kv.get('Z2R_WSSIZE_RAMP_SCALE')}, open={kv.get('Z2R_WSSIZE_RAMP_OPEN')}")
+
+
+def build_profiles_report(title: str) -> discord.Embed:
+    e = discord.Embed(title=title, color=discord.Color.blurple(), description="\n".join(_profile_status_lines()))
+    ramp = _gv_ramp_line()
+    if ramp:
+        e.add_field(name="Googlevideo", value=ramp, inline=False)
+    try:
+        with open(PROMOTER_EVENTS_FILE, errors="replace") as f:
+            last = [l.strip() for l in f if l.strip()][-1:]
+        if last:
+            e.add_field(name="Последнее действие Zenith promoter", value=last[0][:1000], inline=False)
+    except OSError:
+        pass
+    return e
+
+
+PROFILE_REPORT_STAMP = os.path.join(VOICE_LOG_DIR, "profiles_report.last")
+
+
+def _report_due() -> bool:
+    """Сводка не чаще раза в интервал, даже если бота перезапускают (каждый
+    старт раньше слал её через 2 минуты -- серия рестартов давала дубли)."""
+    try:
+        last = float(open(PROFILE_REPORT_STAMP).read().strip())
+    except (OSError, ValueError):
+        last = 0.0
+    return time.time() - last >= PROFILE_REPORT_INTERVAL_HOURS * 3600 - 60
+
+
+def _mark_report_sent() -> None:
+    try:
+        with open(PROFILE_REPORT_STAMP, "w") as f:
+            f.write(str(time.time()))
+    except OSError as e:
+        log.warning("не смог записать %s: %s", PROFILE_REPORT_STAMP, e)
+
+
+@tasks.loop(minutes=10)
+async def profiles_report():
+    if not _report_due():
+        return
+    _mark_report_sent()
+    await notify(build_profiles_report(f"📊 {NODE_LABEL} — профили z2r, сводка (раз в {PROFILE_REPORT_INTERVAL_HOURS:g}ч)"), None)
+
+
+@profiles_report.before_loop
+async def _before_profiles_report():
+    await bot.wait_until_ready()
+    await asyncio.sleep(120)  # не сразу при старте -- даём демонам обновить status
+
+
+@bot.tree.command(name="profiles_status", description="Сводка по всем профилям z2r (autotune + Zenith) прямо сейчас")
+async def profiles_status(interaction: discord.Interaction):
+    await interaction.response.send_message(embed=build_profiles_report(f"📊 {NODE_LABEL} — профили z2r сейчас"), ephemeral=True)
 
 
 @bot.event
