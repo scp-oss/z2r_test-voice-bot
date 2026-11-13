@@ -385,7 +385,37 @@ async def test_voice_connection(guild: discord.Guild, channel: discord.VoiceChan
     return hold_ok, hold_note, connect_time
 
 
+# Общий с Zenith лок песочницы (см. Zenith/orchestrator/sandbox_apply.py):
+# голосовая проба (применить стратегию -> зайти -> подержать) целиком под ним,
+# иначе TCP-раунд Zenith и голосовая проба переписывают конфиг друг другу.
+SANDBOX_LOCK_FILE = os.path.join(ZENITH_SANDBOX_DIR, ".sandbox.lock")
+
+
+class _SandboxLock:
+    async def __aenter__(self):
+        import fcntl
+        self.fd = None
+        try:
+            self.fd = os.open(SANDBOX_LOCK_FILE, os.O_RDONLY)
+        except OSError as e:
+            log.warning("лок песочницы %s недоступен (%s) -- работаю без него", SANDBOX_LOCK_FILE, e)
+            return self
+        await asyncio.get_running_loop().run_in_executor(None, fcntl.flock, self.fd, fcntl.LOCK_EX)
+        return self
+
+    async def __aexit__(self, *exc):
+        import fcntl
+        if self.fd is not None:
+            fcntl.flock(self.fd, fcntl.LOCK_UN)
+            os.close(self.fd)
+
+
 async def run_voice_test(strategy_name: str) -> VoiceTestResult:
+    async with _SandboxLock():
+        return await _run_voice_test_unlocked(strategy_name)
+
+
+async def _run_voice_test_unlocked(strategy_name: str) -> VoiceTestResult:
     strat = state.strategies[strategy_name]
 
     lua_lines = extract_strategy_lines(ZAPRET_CONFIG_PATH, VOICE_PROFILE, strat.strategy_n)
@@ -516,6 +546,11 @@ except Exception:
 
 
 async def handle_probe(request: web.Request) -> web.Response:
+    async with _SandboxLock():
+        return await _handle_probe_unlocked(request)
+
+
+async def _handle_probe_unlocked(request: web.Request) -> web.Response:
     """POST /probe {"lua_desync_lines": ["--lua-desync=..."]} -- для
     Zenith orchestrator/voice_tester.py. Тот же путь, что и слэш-команды
     (apply_to_sandbox + test_voice_connection), только геном приходит
