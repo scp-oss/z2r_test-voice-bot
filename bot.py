@@ -1128,8 +1128,36 @@ def _classify_autotune_line(line: str):
     return None
 
 
+WATCH_SERVICES = [x for x in os.environ.get("WATCH_SERVICES", "zapret2,zenith-autorun,zenith-promoter,zenith-panel,ws-transparent-relay,autotune-profile@1,autotune-profile@2,autotune-profile@3,autotune-profile@4,autotune-profile@5,autotune-profile@6").split(",") if x]
+_service_down: dict[str, int] = {}
+
+
+async def _check_services():
+    """Ключевые юниты: уведомление, если юнит не active 2 проверки подряд
+    (~2 мин, чтобы не дёргаться на штатном рестарте), и когда вернулся."""
+    for unit in WATCH_SERVICES:
+        try:
+            proc = await asyncio.create_subprocess_exec("systemctl", "is-active", unit,
+                                                        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+            out, _ = await asyncio.wait_for(proc.communicate(), 10)
+            st = out.decode().strip()
+        except Exception:
+            continue
+        if st == "active":
+            if _service_down.get(unit, 0) >= 2:
+                await notify(discord.Embed(title=f"🟢 [{NODE_LABEL}] {unit} снова работает", color=discord.Color.green()), None)
+            _service_down.pop(unit, None)
+        elif st in ("inactive", "failed", "activating", "deactivating"):
+            _service_down[unit] = _service_down.get(unit, 0) + 1
+            if _service_down[unit] == 2:
+                await notify(discord.Embed(title=f"🔴 [{NODE_LABEL}] {unit}: {st}",
+                                           description="Сервис не работает уже ~2 минуты. Проверь: journalctl -u " + unit,
+                                           color=discord.Color.red()), None)
+
+
 @tasks.loop(seconds=60)
 async def profile_events_watch():
+    await _check_services()
     import glob
     for path in sorted(glob.glob(os.path.join(AUTOTUNE_STATE_DIR, "daemon_profile_*.log"))):
         for line in _read_new_lines(path):
@@ -1164,7 +1192,9 @@ def _profile_status_lines() -> list[str]:
             with open(os.path.join(AUTOTUNE_STATE_DIR, f"status_profile_{pid}.txt")) as f:
                 body = f.read()
             m = _re.search(r"текущая стратегия=(\d+), провалов подряд=(\d+)/(\d+)", body)
+            cur = None
             if m:
+                cur = m[1]
                 st = f"strategy={m[1]}, провалов подряд {m[2]}/{m[3]}"
         except OSError:
             st = "нет данных autotune"
@@ -1191,7 +1221,57 @@ def _profile_status_lines() -> list[str]:
         icon = "🔴" if pid in _profile_broken else ("🟡" if prob else "🟢")
         extra = f" · 24ч: провалов проверки {prob}, восстановлений {rec}" + (f", новых стратегий {applied}" if applied else "") + (f", переборов без результата {none}" if none else "")
         out.append(f"{icon} **{name}** — {st}{extra}")
+        out.append(_top3(pid, locals().get("cur")))
     return out
+
+
+RANK_LOG_DIR = os.environ.get("RANK_LOG_DIR", "/opt/z2r_autobench/logs")
+_RANK_GLOB = {1: "rank_1_*.raw.tsv", 2: "rank_2_*.raw.tsv", 3: "rank_3_*.raw.tsv", 4: "rank_4_*.raw.tsv",
+              5: "rank_quic_*.raw.tsv", 6: "rank_6_*.raw.tsv"}
+
+
+def _top3(pid: int, current: str | None) -> str:
+    """Топ-3 стратегии профиля по последнему перебору autotune (rank_*.raw.tsv):
+    доля успехов, при равенстве -- больше байт (TCP/QUIC) или меньше мс
+    подключения (голос). Отмечает боевую (★) и возраст данных."""
+    import glob, csv
+    files = sorted(glob.glob(os.path.join(RANK_LOG_DIR, _RANK_GLOB[pid])), key=os.path.getmtime)
+    if not files:
+        return "   топ-3: перебора ещё не было"
+    path = files[-1]
+    agg: dict[str, list] = {}
+    try:
+        with open(path, newline="") as f:
+            rows = list(csv.DictReader(f, delimiter="\t"))
+    except OSError:
+        return "   топ-3: нет доступа к результатам перебора"
+    metric = "ms" if rows and "bytes" not in rows[0] else "bytes"
+    for r in rows:
+        try:
+            a = agg.setdefault(r["strategy"], [0, 0, 0.0])
+            a[0] += 1
+            ok = r["success"] == "1"
+            a[1] += ok
+            if ok:
+                a[2] += float(r.get(metric) or 0)
+        except (KeyError, ValueError):
+            continue
+    if not agg:
+        return "   топ-3: пустой результат перебора"
+    def key(item):
+        n, ok, m = item[1]
+        avg = m / ok if ok else 0
+        return (ok / n, avg if metric == "bytes" else -avg)
+    best = [it for it in sorted(agg.items(), key=key, reverse=True) if it[1][1] > 0][:3]
+    age_h = (time.time() - os.path.getmtime(path)) / 3600
+    if not best:
+        return f"   топ-3: в последнем переборе ({age_h:.0f}ч назад) ни одна стратегия не прошла"
+    parts = []
+    for strat, (n, ok, m) in best:
+        avg = m / ok
+        val = f"{avg / 1000:.0f}КБ" if metric == "bytes" else f"{avg:.0f}мс"
+        parts.append(f"{'★' if strat == current else ''}s{strat} {ok}/{n} · {val}")
+    return f"   топ-3 ({age_h:.0f}ч назад): " + ", ".join(parts)
 
 
 def _gv_ramp_line() -> str:
