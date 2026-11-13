@@ -1019,6 +1019,10 @@ PROMOTER_EVENTS_FILE = os.environ.get("PROMOTER_EVENTS_FILE", "/opt/z2r_autobenc
 PROFILE_REPORT_INTERVAL_HOURS = float(os.environ.get("PROFILE_REPORT_INTERVAL_HOURS", "6"))
 PROFILE_EVENTS_ENABLED = os.environ.get("PROFILE_EVENTS", "1") == "1"
 PROFILE_EVENT_THROTTLE = int(os.environ.get("PROFILE_EVENT_THROTTLE_SECONDS", str(6 * 3600)))
+# Подпись сервера в отчётах -- когда нод несколько (Дом.ру, МТС...), иначе
+# не понять, чья сводка. NODE_LABEL в .env бота, по умолчанию hostname.
+import socket as _socket
+NODE_LABEL = os.environ.get("NODE_LABEL") or _socket.gethostname()
 PROFILE_NAMES = {1: "YT_TLS", 2: "GV_TLS", 3: "RKN_TLS", 4: "DS_TLS", 5: "YT_QUIC_UDP", 6: "VOICE_UDP"}
 
 _RE_TS = _re.compile(r"^\[(\d{4}-\d\d-\d\dT[\d:]+[+-]\d\d:\d\d)\]\s*(.*)$")
@@ -1099,14 +1103,14 @@ async def profile_events_watch():
                 continue
             emoji, title, color = ev
             m = _RE_TS.match(line)
-            e = discord.Embed(title=f"{emoji} {title}", color=color,
+            e = discord.Embed(title=f"{emoji} [{NODE_LABEL}] {title}", color=color,
                               description=(m[2] if m else line)[:1500])
             if m:
                 e.set_footer(text=m[1])
             await notify(e, None)
     for line in _read_new_lines(PROMOTER_EVENTS_FILE):
         ok = "продвинут как" in line
-        e = discord.Embed(title=("🚀 Zenith продвинул новую стратегию" if ok else "↩️ Zenith: откат продвижения"),
+        e = discord.Embed(title=(f"🚀 [{NODE_LABEL}] Zenith продвинул новую стратегию" if ok else f"↩️ [{NODE_LABEL}] Zenith: откат продвижения"),
                           color=discord.Color.blue() if ok else discord.Color.orange(), description=line[:1500])
         await notify(e, None)
 
@@ -1186,7 +1190,7 @@ def build_profiles_report(title: str) -> discord.Embed:
 
 @tasks.loop(hours=max(PROFILE_REPORT_INTERVAL_HOURS, 0.1))
 async def profiles_report():
-    await notify(build_profiles_report(f"📊 Профили z2r — сводка (раз в {PROFILE_REPORT_INTERVAL_HOURS:g}ч)"), None)
+    await notify(build_profiles_report(f"📊 {NODE_LABEL} — профили z2r, сводка (раз в {PROFILE_REPORT_INTERVAL_HOURS:g}ч)"), None)
 
 
 @profiles_report.before_loop
@@ -1197,7 +1201,7 @@ async def _before_profiles_report():
 
 @bot.tree.command(name="profiles_status", description="Сводка по всем профилям z2r (autotune + Zenith) прямо сейчас")
 async def profiles_status(interaction: discord.Interaction):
-    await interaction.response.send_message(embed=build_profiles_report("📊 Профили z2r — сейчас"), ephemeral=True)
+    await interaction.response.send_message(embed=build_profiles_report(f"📊 {NODE_LABEL} — профили z2r сейчас"), ephemeral=True)
 
 
 @bot.event
