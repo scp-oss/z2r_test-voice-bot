@@ -1188,8 +1188,32 @@ def build_profiles_report(title: str) -> discord.Embed:
     return e
 
 
-@tasks.loop(hours=max(PROFILE_REPORT_INTERVAL_HOURS, 0.1))
+PROFILE_REPORT_STAMP = os.path.join(VOICE_LOG_DIR, "profiles_report.last")
+
+
+def _report_due() -> bool:
+    """Сводка не чаще раза в интервал, даже если бота перезапускают (каждый
+    старт раньше слал её через 2 минуты -- серия рестартов давала дубли)."""
+    try:
+        last = float(open(PROFILE_REPORT_STAMP).read().strip())
+    except (OSError, ValueError):
+        last = 0.0
+    return time.time() - last >= PROFILE_REPORT_INTERVAL_HOURS * 3600 - 60
+
+
+def _mark_report_sent() -> None:
+    try:
+        with open(PROFILE_REPORT_STAMP, "w") as f:
+            f.write(str(time.time()))
+    except OSError as e:
+        log.warning("не смог записать %s: %s", PROFILE_REPORT_STAMP, e)
+
+
+@tasks.loop(minutes=10)
 async def profiles_report():
+    if not _report_due():
+        return
+    _mark_report_sent()
     await notify(build_profiles_report(f"📊 {NODE_LABEL} — профили z2r, сводка (раз в {PROFILE_REPORT_INTERVAL_HOURS:g}ч)"), None)
 
 
