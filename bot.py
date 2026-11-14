@@ -972,13 +972,16 @@ async def voice_leave(interaction: discord.Interaction):
 # поэтому он только видит self_stream и зовёт stream_watch/watcher.py
 # (реальный Chrome с тестовым аккаунтом), а вердикт шлёт в ЛС.
 STREAM_WATCH_URL = os.environ.get("STREAM_WATCH_URL", "http://127.0.0.1:8770/watch")
-# STREAM_AUTO_WATCH: "1"/"0" или "auto" (дефолт с 2026-11-14) -- включено,
-# только если на ЭТОЙ ноде стоит наблюдатель (юнит discord-stream-watch).
-# Раньше дефолт был "1", и боты нод без наблюдателя (nod, МТС) на каждый
-# стрим в гильдии слали в ЛС «❌ watcher недоступен ... 127.0.0.1:8770».
+# Наблюдатель есть только там, где стоит юнит discord-stream-watch (NETH-4);
+# на остальных нодах бот на вызов отвечает, что смотреть нечем.
 _STREAM_WATCH_UNIT = "/etc/systemd/system/discord-stream-watch.service"
-_stream_aw = os.environ.get("STREAM_AUTO_WATCH", "auto").strip().lower()
-STREAM_AUTO_WATCH = os.path.exists(_STREAM_WATCH_UNIT) if _stream_aw == "auto" else _stream_aw == "1"
+STREAM_WATCH_AVAILABLE = os.path.exists(_STREAM_WATCH_UNIT) or "STREAM_WATCH_URL" in os.environ
+# STREAM_AUTO_WATCH: заходить ли тестовым аккаунтом на КАЖДЫЙ Go Live сам.
+# С 2026-11-14 дефолт "0": проверка по вызову -- @упоминание бота в чате
+# (см. on_message) или /stream_check. "1" -- старое поведение,
+# "auto" -- включено, если на ноде есть наблюдатель.
+_stream_aw = os.environ.get("STREAM_AUTO_WATCH", "0").strip().lower()
+STREAM_AUTO_WATCH = STREAM_WATCH_AVAILABLE if _stream_aw == "auto" else _stream_aw == "1"
 STREAM_WATCH_SECONDS = int(os.environ.get("STREAM_WATCH_SECONDS", "60"))
 STREAM_WATCH_COOLDOWN = int(os.environ.get("STREAM_WATCH_COOLDOWN", "600"))
 _stream_last_check: dict[int, float] = {}
@@ -1038,10 +1041,83 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
     await notify(stream_embed(res, after.channel, member), None)
 
 
+def _live_streams(guild: discord.Guild) -> list[tuple[discord.VoiceChannel, discord.Member]]:
+    return [(ch, m) for ch in guild.voice_channels for m in ch.members
+            if not m.bot and m.voice and m.voice.self_stream]
+
+
+def _pick_stream(message: discord.Message):
+    """Чей стрим смотреть по @-вызову: упомянутый вместе с ботом человек ->
+    сам автор -> стример в этом голосовом канале (чат войса) -> любой."""
+    live = _live_streams(message.guild)
+    if not live:
+        return None
+    wanted = [u.id for u in message.mentions if not u.bot]
+    for uid in wanted:
+        for ch, m in live:
+            if m.id == uid:
+                return ch, m
+    if wanted:
+        return "NOT_STREAMING"
+    for ch, m in live:
+        if m.id == message.author.id:
+            return ch, m
+    for ch, m in live:
+        if ch.id == message.channel.id:
+            return ch, m
+    return live[0]
+
+
+_stream_call_lock = asyncio.Lock()
+
+
+def _bot_is_mentioned(message: discord.Message) -> bool:
+    if bot.user in message.mentions:
+        return True
+    # В клиенте @ИмяБота часто подставляет управляемую РОЛЬ бота, а не его самого.
+    for r in message.role_mentions:
+        if r.tags is not None and r.tags.bot_id == bot.user.id:
+            return True
+    return False
+
+
+@bot.event
+async def on_message(message: discord.Message):
+    # Вызов наблюдателя по @: «@DR RKN Viewer» -- посмотреть стрим автора
+    # (или того, кого упомянули рядом, или любой идущий). Содержимое
+    # сообщения не читаем -- хватает списка упоминаний, привилегированный
+    # Message Content intent не нужен.
+    if message.author.bot or message.guild is None or message.guild.id != GUILD_ID:
+        return
+    if not _bot_is_mentioned(message):
+        return
+    if not STREAM_WATCH_AVAILABLE:
+        await message.reply(f"На этой ноде ({NODE_LABEL}) наблюдателя за стримами нет -- зови бота ноды, где он стоит.", mention_author=False)
+        return
+    pick = _pick_stream(message)
+    if pick is None:
+        await message.reply("Сейчас никто не стримит. Запусти демонстрацию экрана и позови ещё раз.", mention_author=False)
+        return
+    if pick == "NOT_STREAMING":
+        await message.reply("Упомянутый человек сейчас не стримит.", mention_author=False)
+        return
+    ch, m = pick
+    if _stream_call_lock.locked():
+        await message.reply("⌛ Уже смотрю другой стрим, дождись результата.", mention_author=False)
+        return
+    async with _stream_call_lock:
+        await message.reply(f"👀 Захожу смотреть стрим {m.display_name} в «{ch.name}» ~{STREAM_WATCH_SECONDS}с...", mention_author=False)
+        log.info("Go Live по вызову %s: %s в %s", message.author, m, ch)
+        res = await run_stream_watch(ch, m)
+        log.info("Go Live вердикт: %s", res.get("verdict"))
+        _stream_last_check[m.id] = time.monotonic()
+        await message.reply(embed=stream_embed(res, ch, m), mention_author=True)
+
+
 @bot.tree.command(description="Проверить демонстрацию экрана, идущую сейчас в голосовых каналах")
 async def stream_check(interaction: discord.Interaction):
     guild = interaction.guild or bot.get_guild(GUILD_ID)
-    live = [(ch, m) for ch in guild.voice_channels for m in ch.members if m.voice and m.voice.self_stream]
+    live = _live_streams(guild)
     if not live:
         await interaction.response.send_message("Сейчас никто не стримит.", ephemeral=True)
         return
