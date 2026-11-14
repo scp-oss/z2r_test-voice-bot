@@ -972,7 +972,13 @@ async def voice_leave(interaction: discord.Interaction):
 # поэтому он только видит self_stream и зовёт stream_watch/watcher.py
 # (реальный Chrome с тестовым аккаунтом), а вердикт шлёт в ЛС.
 STREAM_WATCH_URL = os.environ.get("STREAM_WATCH_URL", "http://127.0.0.1:8770/watch")
-STREAM_AUTO_WATCH = os.environ.get("STREAM_AUTO_WATCH", "1") == "1"
+# STREAM_AUTO_WATCH: "1"/"0" или "auto" (дефолт с 2026-11-14) -- включено,
+# только если на ЭТОЙ ноде стоит наблюдатель (юнит discord-stream-watch).
+# Раньше дефолт был "1", и боты нод без наблюдателя (nod, МТС) на каждый
+# стрим в гильдии слали в ЛС «❌ watcher недоступен ... 127.0.0.1:8770».
+_STREAM_WATCH_UNIT = "/etc/systemd/system/discord-stream-watch.service"
+_stream_aw = os.environ.get("STREAM_AUTO_WATCH", "auto").strip().lower()
+STREAM_AUTO_WATCH = os.path.exists(_STREAM_WATCH_UNIT) if _stream_aw == "auto" else _stream_aw == "1"
 STREAM_WATCH_SECONDS = int(os.environ.get("STREAM_WATCH_SECONDS", "60"))
 STREAM_WATCH_COOLDOWN = int(os.environ.get("STREAM_WATCH_COOLDOWN", "600"))
 _stream_last_check: dict[int, float] = {}
@@ -1025,6 +1031,10 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
     await asyncio.sleep(8)  # даём стриму подняться
     res = await run_stream_watch(after.channel, member)
     log.info("Go Live вердикт: %s", res.get("verdict"))
+    if res.get("verdict") == "ERROR" and "watcher недоступен" in str(res.get("note", "")):
+        # Автозапуск без живого наблюдателя -- не спамим ЛС, только лог.
+        log.warning("Go Live: %s", res.get("note"))
+        return
     await notify(stream_embed(res, after.channel, member), None)
 
 
@@ -1288,11 +1298,38 @@ def _gv_ramp_line() -> str:
             f"scale={kv.get('Z2R_WSSIZE_RAMP_SCALE')}, open={kv.get('Z2R_WSSIZE_RAMP_OPEN')}")
 
 
+# Прогон живой VOICE_UDP-стратегии по всем голосовым регионам (z2r_autobench
+# voice_region_sweep.sh, таймер раз в 6 ч) -- сам бот регионы не гоняет,
+# только показывает последний результат в сводке.
+VOICE_REGIONS_FILE = os.environ.get("VOICE_REGIONS_FILE", "/opt/z2r_autobench/logs/voice_regions.json")
+
+
+def _voice_regions_line() -> str | None:
+    try:
+        with open(VOICE_REGIONS_FILE) as f:
+            d = json.load(f)
+    except (OSError, ValueError):
+        return None
+    res = d.get("results") or []
+    ok = [r["region"] for r in res if r.get("success") is True]
+    bad = [r["region"] for r in res if r.get("success") is False]
+    unk = [r["region"] for r in res if r.get("success") is None]
+    age_h = (time.time() - float(d.get("ts") or 0)) / 3600
+    line = f"strategy={d.get('strategy')}: ✅ {len(ok)}/{len(res)}"
+    line += f" · ❌ {', '.join(bad)}" if bad else " · все регионы ок"
+    if unk:
+        line += f" · ? {', '.join(unk)}"
+    return line + f" · {age_h:.0f} ч назад"
+
+
 def build_profiles_report(title: str) -> discord.Embed:
     e = discord.Embed(title=title, color=discord.Color.blurple(), description="\n".join(_profile_status_lines()))
     ramp = _gv_ramp_line()
     if ramp:
         e.add_field(name="Googlevideo", value=ramp, inline=False)
+    vr = _voice_regions_line()
+    if vr:
+        e.add_field(name="🌍 Голос по регионам Discord", value=vr[:1000], inline=False)
     try:
         with open(PROMOTER_EVENTS_FILE, errors="replace") as f:
             last = [l.strip() for l in f if l.strip()][-1:]
