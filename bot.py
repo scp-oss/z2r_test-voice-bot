@@ -1214,7 +1214,7 @@ def _classify_autotune_line(line: str):
     return None
 
 
-WATCH_SERVICES = [x for x in os.environ.get("WATCH_SERVICES", "zapret2,zenith-autorun,zenith-promoter,zenith-panel,ws-transparent-relay,autotune-profile@1,autotune-profile@2,autotune-profile@3,autotune-profile@4,autotune-profile@5,autotune-profile@6").split(",") if x]
+WATCH_SERVICES = [x for x in os.environ.get("WATCH_SERVICES", "zapret2,zenith-autorun,zenith-promoter,zenith-panel,ws-transparent-relay,autotune-daemon,autotune-profile@1,autotune-profile@2,autotune-profile@3,autotune-profile@4,autotune-profile@5,autotune-profile@6").split(",") if x]
 _service_down: dict[str, int] = {}
 
 
@@ -1223,11 +1223,18 @@ async def _check_services():
     (~2 мин, чтобы не дёргаться на штатном рестарте), и когда вернулся."""
     for unit in WATCH_SERVICES:
         try:
-            proc = await asyncio.create_subprocess_exec("systemctl", "is-active", unit,
+            # LoadState: юнита может не быть на этой ноде вовсе (nod/МТС: нет
+            # zenith-panel/promoter и autotune-profile@N, там один autotune-daemon).
+            # «is-active» для такого юнита -- «inactive», и бот слал ложное
+            # «🔴 ... inactive» после каждого своего рестарта.
+            proc = await asyncio.create_subprocess_exec("systemctl", "show", "-p", "LoadState,ActiveState", "--value", unit,
                                                         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
             out, _ = await asyncio.wait_for(proc.communicate(), 10)
-            st = out.decode().strip()
+            load, st = (out.decode().split() + ["", ""])[:2]
         except Exception:
+            continue
+        if load != "loaded":
+            _service_down.pop(unit, None)
             continue
         if st == "active":
             if _service_down.get(unit, 0) >= 2:
