@@ -410,6 +410,23 @@ class _SandboxLock:
             os.close(self.fd)
 
 
+def channel_problem() -> str | None:
+    """Почему бот не сможет войти в тестовый голосовой канал (нет канала / нет прав), или None.
+    Без прав Discord молча игнорирует вход, и connect() падает по таймауту -- для КАЖДОЙ
+    стратегии, что выглядело как «ни одна стратегия не работает»."""
+    guild = bot.get_guild(GUILD_ID)
+    if guild is None:
+        return f"бот не видит сервер id={GUILD_ID}"
+    channel = guild.get_channel(TEST_VOICE_CHANNEL_ID)
+    if channel is None:
+        return f"канал id={TEST_VOICE_CHANNEL_ID} не найден на сервере"
+    p = channel.permissions_for(guild.me)
+    missing = [n for n, ok in (("Просматривать канал", p.view_channel), ("Подключаться", p.connect), ("Говорить", p.speak)) if not ok]
+    if missing:
+        return f"у бота нет прав на голосовой канал «{channel.name}» ({channel.id}): " + ", ".join(missing)
+    return None
+
+
 async def run_voice_test(strategy_name: str) -> VoiceTestResult:
     async with _SandboxLock():
         return await _run_voice_test_unlocked(strategy_name)
@@ -448,6 +465,10 @@ async def _run_voice_test_unlocked(strategy_name: str) -> VoiceTestResult:
             connect_ok=False,
             connect_error=f"Канал с id={TEST_VOICE_CHANNEL_ID} не найден на сервере",
         )
+    problem = channel_problem()
+    if problem:
+        return VoiceTestResult(strategy=strat.name, apply_ok=True, apply_output=apply_output,
+                               connect_ok=False, connect_error="проверка невозможна: " + problem)
 
     hold_ok, hold_note, connect_time = await test_voice_connection(guild, channel)
 
@@ -672,6 +693,17 @@ async def auto_voice_check():
     больше некому, команду никто не вызывал)."""
     if not await ensure_strategies_loaded():
         log.warning("Автопроверка VOICE_UDP пропущена: список стратегий пуст (%s)", state.strategies_error)
+        return
+    problem = channel_problem()
+    if problem:
+        log.warning("Автопроверка VOICE_UDP не запущена: %s", problem)
+        await notify(discord.Embed(
+            title="⚠️ Автопроверка VOICE_UDP не запущена",
+            description=f"{problem}.\n\nСтратегии не проверялись: без этих прав Discord не пускает бота в канал, "
+                        "и любая стратегия выглядела бы нерабочей. Выдайте роли бота права "
+                        "«Просматривать канал», «Подключаться» и «Говорить» на этот канал "
+                        "(или укажите другой канал в TEST_VOICE_CHANNEL_ID).",
+            color=discord.Color.orange()), None)
         return
     log.info("Автопроверка VOICE_UDP: запускаю %d проход(ов)...", AUTO_CHECK_PASSES)
     async with _check_lock:
@@ -937,6 +969,12 @@ async def voice_rank(interaction: discord.Interaction, passes: int = 3):
         return
     if passes < 1 or passes > 10:
         await interaction.response.send_message("passes должен быть от 1 до 10 (иначе тест займёт слишком много времени).", ephemeral=True)
+        return
+    problem = channel_problem()
+    if problem:
+        await interaction.response.send_message(
+            f"Проверка невозможна: {problem}. Выдайте роли бота «Просматривать канал», «Подключаться» и «Говорить» на этот канал.",
+            ephemeral=True)
         return
 
     names = list(state.strategies.keys())
@@ -1252,7 +1290,7 @@ async def _check_services():
 async def profile_events_watch():
     await _check_services()
     import glob
-    for path in sorted(glob.glob(os.path.join(AUTOTUNE_STATE_DIR, "daemon_profile_*.log"))):
+    for path in sorted(glob.glob(os.path.join(AUTOTUNE_STATE_DIR, "daemon_profile_*.log"))) + [os.path.join(AUTOTUNE_STATE_DIR, "daemon.log")]:
         for line in _read_new_lines(path):
             ev = _classify_autotune_line(line)
             if not ev:
@@ -1276,24 +1314,63 @@ async def _before_profile_events_watch():
     await bot.wait_until_ready()
 
 
+_RE_STATUS_LINE = _re.compile(r"^\s*(\d+) (\w+): текущая стратегия=(\d+), провалов подряд=(\d+)/(\d+)(?: \(ПРОПУЩЕН: ([^)]*)\))?")
+
+def _status_map() -> dict:
+    """autotune_daemon пишет состояние всех профилей в один status.txt:
+    «  8 FB_TLS: текущая стратегия=0, провалов подряд=4/3 (ПРОПУЩЕН: SKIP_PROFILES)»."""
+    out = {}
+    try:
+        with open(os.path.join(AUTOTUNE_STATE_DIR, "status.txt"), errors="replace") as f:
+            for line in f:
+                m = _RE_STATUS_LINE.match(line)
+                if m: out[int(m[1])] = {"name": m[2], "cur": m[3], "fails": m[4], "thr": m[5], "skip": m[6] or ""}
+    except OSError:
+        pass
+    return out
+
+
+def _user_skip() -> set:
+    """Профили, исключённые из autotune (SKIP_PROFILES): из последней строки запуска в daemon.log."""
+    try:
+        with open(os.path.join(AUTOTUNE_STATE_DIR, "daemon.log"), errors="replace") as f:
+            f.seek(max(0, os.path.getsize(f.name) - 300_000)); last = ""
+            for line in f:
+                if "user-skip=" in line: last = line
+        m = _re.search(r"user-skip=([\d ]+)", last)
+        return {int(x) for x in m[1].split()} if m else set()
+    except OSError:
+        return set()
+
+
 def _profile_status_lines() -> list[str]:
     out = []
     since = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(hours=24)
-    for pid, name in PROFILE_NAMES.items():
-        st = ""
+    smap = _status_map()
+    names = dict(PROFILE_NAMES); names.update({k: v["name"] for k, v in smap.items() if k not in names})
+    for pid, name in sorted(names.items()):
+        st = ""; cur = None
         try:
             with open(os.path.join(AUTOTUNE_STATE_DIR, f"status_profile_{pid}.txt")) as f:
                 body = f.read()
             m = _re.search(r"текущая стратегия=(\d+), провалов подряд=(\d+)/(\d+)", body)
-            cur = None
             if m:
                 cur = m[1]
                 st = f"strategy={m[1]}, провалов подряд {m[2]}/{m[3]}"
         except OSError:
-            st = "нет данных autotune"
+            v = smap.get(pid)
+            if not v and pid in _user_skip(): st = "ведёт zator, autotune для профиля выключен"
+            elif not v: st = "нет данных autotune"
+            elif v["skip"].startswith("SKIP_PROFILES"): st = "ведёт zator, autotune для профиля выключен"
+            elif v["skip"]: st = f"autotune пропускает: {v['skip']}"
+            else:
+                cur = v["cur"]; st = f"strategy={v['cur']}, провалов подряд {v['fails']}/{v['thr']}"
+                if int(v["fails"]) >= int(v["thr"]): _profile_broken.add(pid)
         prob = rec = applied = none = 0
+        lp = os.path.join(AUTOTUNE_STATE_DIR, f"daemon_profile_{pid}.log")
+        if not os.path.exists(lp): lp = os.path.join(AUTOTUNE_STATE_DIR, "daemon.log")   # общий журнал всех профилей
         try:
-            with open(os.path.join(AUTOTUNE_STATE_DIR, f"daemon_profile_{pid}.log"), errors="replace") as f:
+            with open(lp, errors="replace") as f:
                 f.seek(max(0, os.path.getsize(f.name) - 400_000))
                 for line in f:
                     m = _RE_TS.match(line.strip())
@@ -1305,6 +1382,9 @@ def _profile_status_lines() -> list[str]:
                     except ValueError:
                         continue
                     t = m[2]
+                    pm = _RE_PID.search(t)
+                    if os.path.basename(lp) == "daemon.log" and (not pm or int(pm[1]) != pid):
+                        continue
                     prob += "PROBLEM:" in t
                     rec += "снова работает" in t
                     applied += "применена новая стратегия" in t
@@ -1328,6 +1408,8 @@ def _top3(pid: int, current: str | None) -> str:
     доля успехов, при равенстве -- больше байт (TCP/QUIC) или меньше мс
     подключения (голос). Отмечает боевую (★) и возраст данных."""
     import glob, csv
+    if pid not in _RANK_GLOB:
+        return "   топ-3: —"
     files = sorted(glob.glob(os.path.join(RANK_LOG_DIR, _RANK_GLOB[pid])), key=os.path.getmtime)
     if not files:
         return "   топ-3: перебора ещё не было"
